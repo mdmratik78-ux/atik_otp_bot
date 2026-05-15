@@ -36,7 +36,7 @@ open(_PID_FILE, "w").write(str(_my_pid))
 API_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 SUPER_ADMIN_IDS = [6664150885, 8523774444]
 ADMIN_IDS = list(SUPER_ADMIN_IDS)
-CHANNEL_2 = "https://t.me/mailbotnewsofficial"
+CHANNEL_2 = ""
 
 # ── Panel 1 (Mahofuza) ───────────────────────────────────────────────────────
 P1_BASE_URL = "http://91.232.105.47/ints"
@@ -227,12 +227,12 @@ threading.Thread(target=_admin_expiry_checker, daemon=True).start()
 
 GROUP_SETTINGS_FILE = "group_settings.json"
 _group_settings = load_json(GROUP_SETTINGS_FILE, {
-    "otp_group_id": -1003738666960,
-    "otp_group_link": "https://t.me/aR_OTP_rcv",
+    "otp_group_id": None,
+    "otp_group_link": "",
     "auto_delete": True,
     "auto_delete_seconds": 3600,
-    "channel2": "https://t.me/mailbotnewsofficial",
-    "bot_link": "https://t.me/ar_otp_bot",
+    "channel2": "",
+    "bot_link": "",
     "support_id": "",
 })
 
@@ -278,11 +278,11 @@ def _check_member(chat_ref, user_id):
 
 
 def get_channel2():
-    return _group_settings.get("channel2", "https://t.me/mailbotnewsofficial")
+    return _group_settings.get("channel2", "")
 
 
 def get_bot_link():
-    return _group_settings.get("bot_link", "https://t.me/ar_otp_bot")
+    return _group_settings.get("bot_link", "")
 
 
 def is_auto_delete():
@@ -432,18 +432,31 @@ def mask_number(number):
 # ── OTP Messages ──────────────────────────────────────────────────────────────
 
 
+def _ensure_code_tag(text, value):
+    """Wrap `value` in <code> if not already wrapped."""
+    v = str(value)
+    if f"<code>{v}</code>" in text:
+        return text
+    return text.replace(v, f"<code>{v}</code>", 1)
+
+
 def send_otp_message(chat_id, otp, number, seconds, service=""):
     svc = service.upper() if service else "—"
     c_name, flag = get_country_details(number)
+    otp_str = str(otp)
     if chat_id == get_otp_group_id():
         message = get_template("otp_group").format(
-            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp
+            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
         )
+        message = _ensure_code_tag(message, otp_str)
         markup = types.InlineKeyboardMarkup()
-        markup.row(
-            types.InlineKeyboardButton("🤖 𝗡𝘂𝗺𝗯𝗲𝗿 𝗕𝗼𝘁", url=get_bot_link()),
-            types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", url=get_channel2()),
-        )
+        _btns = []
+        if get_bot_link():
+            _btns.append(types.InlineKeyboardButton("🤖 𝗡𝘂𝗺𝗯𝗲𝗿 𝗕𝗼𝘁", url=get_bot_link()))
+        if get_channel2():
+            _btns.append(types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", url=get_channel2()))
+        if _btns:
+            markup.row(*_btns)
         try:
             sent = bot.send_message(
                 chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=markup
@@ -454,8 +467,9 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             print(f"[MONITOR] Group send error: {e}")
     else:
         message = get_template("otp_dm").format(
-            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp
+            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
         )
+        message = _ensure_code_tag(message, otp_str)
         try:
             bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
         except Exception as e:
@@ -1659,8 +1673,11 @@ def start_cmd(message):
     uname = f"@{u.username}" if u.username else (u.first_name or "User")
     uid_str = u.id
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔥 𝗢𝗧𝗣 𝗚𝗿𝘂𝗽 𝗝𝗢𝗜𝗡 🔥", url=get_otp_group_link() or CHANNEL_1))
-    markup.add(types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 𝗝𝗢𝗜𝗡", url=get_channel2()))
+    _grp = get_otp_group_link() or CHANNEL_1
+    if _grp:
+        markup.add(types.InlineKeyboardButton("🔥 𝗢𝗧𝗣 𝗚𝗿𝘂𝗽 𝗝𝗢𝗜𝗡 🔥", url=_grp))
+    if get_channel2():
+        markup.add(types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 𝗝𝗢𝗜𝗡", url=get_channel2()))
     markup.add(types.InlineKeyboardButton("✅ 𝗩𝗘𝗥𝗜𝗙𝗬 𝗞𝗢𝗥𝗢 ✅", callback_data="v"))
     bot.send_message(
         message.chat.id,
@@ -2187,9 +2204,10 @@ def callback_handler(call):
                     types.InlineKeyboardButton("🔄 New Number", callback_data=f"n:{svc}:{scnt}"),
                     types.InlineKeyboardButton("🌍 Change Country", callback_data=f"s:{svc}"),
                 )
-                init_kb.add(
-                    types.InlineKeyboardButton("📢 OTP Group", url=get_otp_group_link()),
-                )
+                if get_otp_group_link():
+                    init_kb.add(
+                        types.InlineKeyboardButton("📢 OTP Group", url=get_otp_group_link()),
+                    )
                 res = get_template("number_assigned").format(
                     svc=svc.capitalize(), flag=flag, country=c_name, number=display_num
                 )
@@ -3666,9 +3684,10 @@ def _start_countdown(chat_id, msg_id, svc, flag, c_name, display_num, scnt):
                 types.InlineKeyboardButton("🔄 New Number", callback_data=f"n:{svc}:{scnt}"),
                 types.InlineKeyboardButton("🌍 Change Country", callback_data=f"s:{svc}"),
             )
-            kb.add(
-                types.InlineKeyboardButton("📢 OTP Group", url=get_otp_group_link()),
-            )
+            if get_otp_group_link():
+                kb.add(
+                    types.InlineKeyboardButton("📢 OTP Group", url=get_otp_group_link()),
+                )
             try:
                 bot.edit_message_text(
                     text, chat_id, msg_id,
