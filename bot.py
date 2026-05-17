@@ -227,6 +227,7 @@ def _admin_expiry_checker():
 threading.Thread(target=_admin_expiry_checker, daemon=True).start()
 
 GROUP_SETTINGS_FILE = "group_settings.json"
+# <<SYNC:_group_settings_defaults:START>>
 _group_settings = load_json(GROUP_SETTINGS_FILE, {
     "otp_group_id": None,
     "otp_group_link": "",
@@ -236,6 +237,7 @@ _group_settings = load_json(GROUP_SETTINGS_FILE, {
     "bot_link": "",
     "support_id": "",
 })
+# <<SYNC:_group_settings_defaults:END>>
 
 CHANNEL_1 = _group_settings["otp_group_link"]
 OTP_GROUP_ID = _group_settings["otp_group_id"]
@@ -243,6 +245,7 @@ OTP_GROUP_ID = _group_settings["otp_group_id"]
 
 def save_group_settings():
     save_json(GROUP_SETTINGS_FILE, _group_settings)
+    _sync_settings_to_botpy()
 
 
 def get_otp_group_id():
@@ -302,6 +305,7 @@ def _schedule_delete(chat_id, msg_id):
 # ── Message templates ──────────────────────────────────────────────────────────
 
 TEMPLATES_FILE = "message_templates.json"
+# <<SYNC:_DEFAULT_TEMPLATES:START>>
 _DEFAULT_TEMPLATES = {
     "start": (
         "🔥 <b>𝗔𝗥 𝗢𝗧𝗣 𝗕𝗢𝗧-𝗲 𝗦𝗔𝗚𝗢𝗧𝗢𝗠!</b> 🔥\n\n"
@@ -365,6 +369,7 @@ _DEFAULT_TEMPLATES = {
         "🤖🔥 <i>𝙋𝙤𝙬𝙚𝙧𝙚𝙙 𝙗𝙮</i>  <b>𝗔𝗥 𝗢𝗧𝗣 𝗕𝗢𝗧</b>  🔥🤖"
     ),
 }
+# <<SYNC:_DEFAULT_TEMPLATES:END>>
 _templates = load_json(TEMPLATES_FILE, dict(_DEFAULT_TEMPLATES))
 for _k, _v in _DEFAULT_TEMPLATES.items():
     if _k not in _templates:
@@ -372,8 +377,77 @@ for _k, _v in _DEFAULT_TEMPLATES.items():
 _edit_template_state = {}
 
 
+def _fmt_pyval(val, indent=0):
+    """Format a Python value as readable source code."""
+    pad = "    " * indent
+    inner = "    " * (indent + 1)
+    if isinstance(val, dict):
+        if not val:
+            return "{}"
+        lines = ["{"]
+        for k, v in val.items():
+            lines.append(f"{inner}{repr(k)}: {repr(v)},")
+        lines.append(f"{pad}}}")
+        return "\n".join(lines)
+    elif isinstance(val, list):
+        if not val:
+            return "[]"
+        lines = ["["]
+        for item in val:
+            lines.append(f"{inner}{repr(item)},")
+        lines.append(f"{pad}]")
+        return "\n".join(lines)
+    return repr(val)
+
+
+def _sync_block(source, marker_name, new_content):
+    """Replace content between <<SYNC:X:START>> and <<SYNC:X:END>> markers."""
+    start_marker = f"# <<SYNC:{marker_name}:START>>"
+    end_marker   = f"# <<SYNC:{marker_name}:END>>"
+    s = source.find(start_marker)
+    e = source.find(end_marker)
+    if s == -1 or e == -1:
+        return source
+    return (
+        source[:s + len(start_marker)] + "\n" +
+        new_content + "\n" +
+        source[e:]
+    )
+
+
+def _sync_settings_to_botpy():
+    """Auto-patch bot.py so its hardcoded defaults always match live settings."""
+    try:
+        bot_file = os.path.abspath(__file__)
+        with open(bot_file, "r", encoding="utf-8") as f:
+            source = f.read()
+
+        # Sync message templates
+        source = _sync_block(
+            source, "_DEFAULT_TEMPLATES",
+            f"_DEFAULT_TEMPLATES = {_fmt_pyval(_templates)}"
+        )
+        # Sync services list
+        source = _sync_block(
+            source, "_DEFAULT_SERVICES",
+            f"_DEFAULT_SERVICES = {_fmt_pyval(_services)}"
+        )
+        # Sync group settings defaults
+        source = _sync_block(
+            source, "_group_settings_defaults",
+            f"_group_settings = load_json(GROUP_SETTINGS_FILE, {_fmt_pyval(_group_settings)})"
+        )
+
+        with open(bot_file, "w", encoding="utf-8") as f:
+            f.write(source)
+        print("[SYNC] ✅ bot.py auto-patched with latest settings")
+    except Exception as e:
+        print(f"[SYNC] ❌ Failed to patch bot.py: {e}")
+
+
 def save_templates():
     save_json(TEMPLATES_FILE, _templates)
+    _sync_settings_to_botpy()
 
 
 def get_template(key):
@@ -401,12 +475,14 @@ _TEMPLATE_VARS = {
 # ── End Message templates ──────────────────────────────────────────────────────
 
 SERVICES_FILE = "services.json"
+# <<SYNC:_DEFAULT_SERVICES:START>>
 _DEFAULT_SERVICES = [
     {"label": "Instagram →", "key": "instagram"},
     {"label": "Facebook 💎", "key": "facebook"},
     {"label": "WhatsApp", "key": "whatsapp"},
     {"label": "PC Clone 💎", "key": "pc clone"},
 ]
+# <<SYNC:_DEFAULT_SERVICES:END>>
 _services = load_json(SERVICES_FILE, list(_DEFAULT_SERVICES))
 _addservice_state = {}
 _countdowns = {}
@@ -493,17 +569,31 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
     svc = service.upper() if service else "—"
     c_name, flag = get_country_details(number)
     otp_str = str(otp)
-    if chat_id == get_otp_group_id():
+    _grp_vars = dict(svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str)
+    _dm_vars  = dict(svc=svc, number=(number if str(number).startswith("+") else "+" + str(number)),
+                     country=c_name, flag=flag, otp=otp_str)
+
+    def _build_message(key, vars_dict):
+        """Return (text, used_default). Falls back to default on any error."""
         try:
-            message = get_template("otp_group").format(
-                svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
-            )
-        except Exception as fmt_err:
-            print(f"[OTP-GROUP] ⚠️ Template format error, using default: {fmt_err}")
-            message = _DEFAULT_TEMPLATES["otp_group"].format(
-                svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
-            )
-        message = _ensure_code_tag(message, otp_str)
+            txt = get_template(key).format(**vars_dict)
+            return _ensure_code_tag(txt, otp_str), False
+        except Exception as e:
+            print(f"[TEMPLATE] ⚠️ Custom template '{key}' format error, using default: {e}")
+        txt = _DEFAULT_TEMPLATES[key].format(**vars_dict)
+        return _ensure_code_tag(txt, otp_str), True
+
+    def _try_send(label, chat_id, text, markup):
+        """Send message; if Telegram rejects it return (None, err_str)."""
+        try:
+            result, rl = _send_with_retry(bot.send_message,
+                                          chat_id=chat_id, text=text,
+                                          parse_mode="HTML", reply_markup=markup)
+            return result, rl, None
+        except Exception as e:
+            return None, 0, str(e)
+
+    if chat_id == get_otp_group_id():
         markup = types.InlineKeyboardMarkup()
         _btns = []
         if get_bot_link():
@@ -512,32 +602,25 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             _btns.append(types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", url=get_channel2()))
         if _btns:
             markup.row(*_btns)
-        try:
-            sent, rl = _send_with_retry(
-                bot.send_message,
-                chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=markup
-            )
-            if sent:
-                print(f"[OTP-GROUP] ✅ Sent OTP={otp_str} num={mask_number(number)} svc={svc} to group {chat_id}")
-                if is_auto_delete():
-                    _schedule_delete(chat_id, sent.message_id)
-            else:
-                print(f"[OTP-GROUP] ❌ FAILED to send OTP={otp_str} num={mask_number(number)} — rate limited {rl}s")
-        except Exception as e:
-            print(f"[OTP-GROUP] ❌ Exception sending to group {chat_id}: {e}")
+
+        message, used_default = _build_message("otp_group", _grp_vars)
+        sent, rl, err = _try_send("GROUP", chat_id, message, markup)
+
+        # If custom template caused a send error, retry with default
+        if err and not used_default:
+            print(f"[OTP-GROUP] ⚠️ Send failed (custom template HTML error?): {err} — retrying with default")
+            message = _ensure_code_tag(_DEFAULT_TEMPLATES["otp_group"].format(**_grp_vars), otp_str)
+            sent, rl, err = _try_send("GROUP-DEFAULT", chat_id, message, markup)
+
+        if err:
+            print(f"[OTP-GROUP] ❌ Exception sending to group {chat_id}: {err}")
+        elif sent:
+            print(f"[OTP-GROUP] ✅ Sent OTP={otp_str} num={mask_number(number)} svc={svc} to group {chat_id}")
+            if is_auto_delete():
+                _schedule_delete(chat_id, sent.message_id)
+        else:
+            print(f"[OTP-GROUP] ❌ FAILED to send OTP={otp_str} num={mask_number(number)} — rate limited {rl}s")
     else:
-        full_number = number if str(number).startswith("+") else "+" + str(number)
-        try:
-            message = get_template("otp_dm").format(
-                svc=svc, number=full_number, country=c_name, flag=flag, otp=otp_str
-            )
-        except Exception as fmt_err:
-            print(f"[OTP-DM] ⚠️ Template format error, using default: {fmt_err}")
-            message = _DEFAULT_TEMPLATES["otp_dm"].format(
-                svc=svc, number=full_number, country=c_name, flag=flag, otp=otp_str
-            )
-        message = _ensure_code_tag(message, otp_str)
-        # Build action buttons using user's last known service/country
         uid = chat_id  # DM: chat_id == user_id
         last_svc_info = _user_last_svc.get(uid)
         dm_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -551,6 +634,7 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             dm_markup.add(
                 types.InlineKeyboardButton("📢 𝗢𝗧𝗣 𝗚𝗿𝗼𝘂𝗽", url=get_otp_group_link()),
             )
+
         # Delete the previous "Number Assigned" message when OTP arrives
         prev_msg_id = _user_last_num_msg.get(uid)
         if prev_msg_id:
@@ -559,19 +643,24 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             except Exception:
                 pass
             _user_last_num_msg.pop(uid, None)
-        try:
-            result, rl = _send_with_retry(
-                bot.send_message,
-                chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=dm_markup
-            )
-            if result:
-                print(f"[OTP-DM] ✅ Sent OTP={otp_str} to user {chat_id}")
-                # Do NOT store OTP message in _user_last_num_msg —
-                # that tracker is only for "Number Assigned" messages
-            else:
-                print(f"[OTP-DM] ❌ FAILED to send OTP={otp_str} to user {chat_id} — rate limited {rl}s")
-        except Exception as e:
-            print(f"[OTP-DM] ❌ Exception sending to user {chat_id}: {e}")
+
+        message, used_default = _build_message("otp_dm", _dm_vars)
+        result, rl, err = _try_send("DM", chat_id, message, dm_markup)
+
+        # If custom template caused a send error, retry with default
+        if err and not used_default:
+            print(f"[OTP-DM] ⚠️ Send failed (custom template HTML error?): {err} — retrying with default")
+            message = _ensure_code_tag(_DEFAULT_TEMPLATES["otp_dm"].format(**_dm_vars), otp_str)
+            result, rl, err = _try_send("DM-DEFAULT", chat_id, message, dm_markup)
+
+        if err:
+            print(f"[OTP-DM] ❌ Exception sending to user {chat_id}: {err}")
+        elif result:
+            print(f"[OTP-DM] ✅ Sent OTP={otp_str} to user {chat_id}")
+            # Do NOT store OTP message in _user_last_num_msg —
+            # that tracker is only for "Number Assigned" messages
+        else:
+            print(f"[OTP-DM] ❌ FAILED to send OTP={otp_str} to user {chat_id} — rate limited {rl}s")
 
 
 def _dispatch_otp(otp, number, seconds, service=""):
@@ -797,6 +886,7 @@ _migrate_dynamic_panels()
 
 def save_dynamic_panels():
     save_json(DYNAMIC_PANELS_FILE, _dynamic_panels)
+    _sync_settings_to_botpy()
 
 
 def _get_dp_lock(pid):
@@ -2181,6 +2271,7 @@ def main_menu(user_id):
 
 def save_services():
     save_json(SERVICES_FILE, _services)
+    _sync_settings_to_botpy()
 
 
 def _get_svc_map():
