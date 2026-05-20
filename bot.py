@@ -5,7 +5,6 @@ import os
 import re
 import time
 import threading
-import heapq
 import datetime
 import requests
 import phonenumbers
@@ -92,13 +91,33 @@ P6_CDR_DATA_URL = P6_BASE_URL + "/agent/res/data_smsranges.php"
 P6_USER_NAME = "Sagardas50"
 P6_PASSWORD = "Sagardas50"
 
+# ── Panel 7 (Rabbi12 / 54.36.173.235) ────────────────────────────────────────
+P7_BASE_URL = "http://54.36.173.235/ints"
+P7_LOGIN_PAGE = P7_BASE_URL + "/login"
+P7_SIGNIN_URL = P7_BASE_URL + "/signin"
+P7_CDR_PAGE = P7_BASE_URL + "/agent/SMSCDRStats"
+P7_CDR_DATA_URL = P7_BASE_URL + "/agent/res/data_smscdr.php"
+P7_USER_NAME = "Rabbi12"
+P7_PASSWORD = "Rabbi@"
+
+# ── Panel 8 (Rabbi5 / 54.39.104.241) ─────────────────────────────────────────
+P8_BASE_URL = "http://54.39.104.241/ints"
+P8_LOGIN_PAGE = P8_BASE_URL + "/login"
+P8_SIGNIN_URL = P8_BASE_URL + "/signin"
+P8_CDR_PAGE = P8_BASE_URL + "/agent/SMSCDRStats"
+P8_CDR_DATA_URL = P8_BASE_URL + "/agent/res/data_smscdr.php"
+P8_USER_NAME = "Rabbi5"
+P8_PASSWORD = "Rabbi5"
+
 
 POLL_INTERVAL = 8
 DATA_FILE = "stock_data.json"
 USERS_FILE = "users.json"
 SEEN_FILE = "seen_otps.json"
+OTP_COUNTS_FILE = "otp_counts.json"
+VERIFIED_USERS_FILE = "verified_users.json"
 
-bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=200)
+bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=100)
 
 # ── Persistent helpers ────────────────────────────────────────────────────────
 
@@ -134,6 +153,18 @@ seen_otps = load_json(SEEN_FILE, {})
 
 USER_NAMES_FILE = "user_names.json"
 user_names = load_json(USER_NAMES_FILE, {})
+
+_otp_counts: dict = load_json(OTP_COUNTS_FILE, {})
+_otp_counts_lock = threading.Lock()
+
+_verified_users: set = set(load_json(VERIFIED_USERS_FILE, []))
+_verified_users_lock = threading.Lock()
+
+
+def _save_verified_users():
+    with _verified_users_lock:
+        save_json(VERIFIED_USERS_FILE, list(_verified_users))
+
 
 ADMINS_FILE = "admins.json"
 ADMIN_EXPIRY_FILE = "admin_expiry.json"
@@ -228,7 +259,6 @@ def _admin_expiry_checker():
 threading.Thread(target=_admin_expiry_checker, daemon=True).start()
 
 GROUP_SETTINGS_FILE = "group_settings.json"
-# <<SYNC:_group_settings_defaults:START>>
 _group_settings = load_json(GROUP_SETTINGS_FILE, {
     "otp_group_id": None,
     "otp_group_link": "",
@@ -238,7 +268,6 @@ _group_settings = load_json(GROUP_SETTINGS_FILE, {
     "bot_link": "",
     "support_id": "",
 })
-# <<SYNC:_group_settings_defaults:END>>
 
 CHANNEL_1 = _group_settings["otp_group_link"]
 OTP_GROUP_ID = _group_settings["otp_group_id"]
@@ -246,7 +275,6 @@ OTP_GROUP_ID = _group_settings["otp_group_id"]
 
 def save_group_settings():
     save_json(GROUP_SETTINGS_FILE, _group_settings)
-    _sync_settings_to_botpy()
 
 
 def get_otp_group_id():
@@ -282,6 +310,39 @@ def _check_member(chat_ref, user_id):
         return None
 
 
+def _is_verified(uid):
+    """Admin always passes. Normal users must have completed the join+verify flow."""
+    if uid in ADMIN_IDS:
+        return True
+    grp_id = get_otp_group_id()
+    ch2_link = get_channel2()
+    ch2_ref = _extract_username(ch2_link)
+    if not grp_id and not ch2_ref:
+        return True
+    with _verified_users_lock:
+        return uid in _verified_users
+
+
+def _send_join_prompt(chat_id, grp_link=None, ch2_link=None):
+    """Send the join + verify prompt to a user who hasn't verified."""
+    _grp = grp_link or get_otp_group_link()
+    _ch2 = ch2_link or get_channel2()
+    markup = types.InlineKeyboardMarkup()
+    if _grp:
+        markup.add(types.InlineKeyboardButton("🔥 OTP Group JOIN 🔥", url=_grp))
+    if _ch2:
+        markup.add(types.InlineKeyboardButton("📢 Main Channel JOIN", url=_ch2))
+    markup.add(types.InlineKeyboardButton("✅ 𝗩𝗘𝗥𝗜𝗙𝗬 𝗞𝗢𝗥𝗢 ✅", callback_data="v"))
+    bot.send_message(
+        chat_id,
+        "⛔ <b>ACCESS DENIED!</b>\n\n"
+        "Bot use korte <b>Group</b> এবং <b>Channel</b> — দুটোতেই JOIN করতে হবে!\n\n"
+        "👇 Join করে নিচের <b>✅ VERIFY</b> বাটন চাপো:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
 def get_channel2():
     return _group_settings.get("channel2", "")
 
@@ -294,46 +355,18 @@ def is_auto_delete():
     return _group_settings.get("auto_delete", True)
 
 
-_delete_queue = []
-_delete_queue_lock = threading.Lock()
-_delete_queue_event = threading.Event()
-
-
-def _delete_worker():
-    """Single background thread that handles all scheduled message deletions."""
-    while True:
-        with _delete_queue_lock:
-            now = time.time()
-            while _delete_queue and _delete_queue[0][0] <= now:
-                _, chat_id, msg_id = heapq.heappop(_delete_queue)
-                try:
-                    bot.delete_message(chat_id, msg_id)
-                except Exception:
-                    pass
-            next_fire = _delete_queue[0][0] if _delete_queue else None
-        if next_fire is None:
-            _delete_queue_event.wait(timeout=60)
-            _delete_queue_event.clear()
-        else:
-            wait = max(0.0, next_fire - time.time())
-            _delete_queue_event.wait(timeout=wait)
-            _delete_queue_event.clear()
-
-
-threading.Thread(target=_delete_worker, daemon=True, name="delete-worker").start()
-
-
 def _schedule_delete(chat_id, msg_id):
     delay = _group_settings.get("auto_delete_seconds", 3600)
-    fire_at = time.time() + delay
-    with _delete_queue_lock:
-        heapq.heappush(_delete_queue, (fire_at, chat_id, msg_id))
-    _delete_queue_event.set()
+    def _do_delete():
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+    threading.Timer(delay, _do_delete).start()
 
 # ── Message templates ──────────────────────────────────────────────────────────
 
 TEMPLATES_FILE = "message_templates.json"
-# <<SYNC:_DEFAULT_TEMPLATES:START>>
 _DEFAULT_TEMPLATES = {
     "start": (
         "🔥 <b>𝗔𝗥 𝗢𝗧𝗣 𝗕𝗢𝗧-𝗲 𝗦𝗔𝗚𝗢𝗧𝗢𝗠!</b> 🔥\n\n"
@@ -397,7 +430,6 @@ _DEFAULT_TEMPLATES = {
         "🤖🔥 <i>𝙋𝙤𝙬𝙚𝙧𝙚𝙙 𝙗𝙮</i>  <b>𝗔𝗥 𝗢𝗧𝗣 𝗕𝗢𝗧</b>  🔥🤖"
     ),
 }
-# <<SYNC:_DEFAULT_TEMPLATES:END>>
 _templates = load_json(TEMPLATES_FILE, dict(_DEFAULT_TEMPLATES))
 for _k, _v in _DEFAULT_TEMPLATES.items():
     if _k not in _templates:
@@ -405,77 +437,8 @@ for _k, _v in _DEFAULT_TEMPLATES.items():
 _edit_template_state = {}
 
 
-def _fmt_pyval(val, indent=0):
-    """Format a Python value as readable source code."""
-    pad = "    " * indent
-    inner = "    " * (indent + 1)
-    if isinstance(val, dict):
-        if not val:
-            return "{}"
-        lines = ["{"]
-        for k, v in val.items():
-            lines.append(f"{inner}{repr(k)}: {repr(v)},")
-        lines.append(f"{pad}}}")
-        return "\n".join(lines)
-    elif isinstance(val, list):
-        if not val:
-            return "[]"
-        lines = ["["]
-        for item in val:
-            lines.append(f"{inner}{repr(item)},")
-        lines.append(f"{pad}]")
-        return "\n".join(lines)
-    return repr(val)
-
-
-def _sync_block(source, marker_name, new_content):
-    """Replace content between <<SYNC:X:START>> and <<SYNC:X:END>> markers."""
-    start_marker = f"# <<SYNC:{marker_name}:START>>"
-    end_marker   = f"# <<SYNC:{marker_name}:END>>"
-    s = source.find(start_marker)
-    e = source.find(end_marker)
-    if s == -1 or e == -1:
-        return source
-    return (
-        source[:s + len(start_marker)] + "\n" +
-        new_content + "\n" +
-        source[e:]
-    )
-
-
-def _sync_settings_to_botpy():
-    """Auto-patch bot.py so its hardcoded defaults always match live settings."""
-    try:
-        bot_file = os.path.abspath(__file__)
-        with open(bot_file, "r", encoding="utf-8") as f:
-            source = f.read()
-
-        # Sync message templates
-        source = _sync_block(
-            source, "_DEFAULT_TEMPLATES",
-            f"_DEFAULT_TEMPLATES = {_fmt_pyval(_templates)}"
-        )
-        # Sync services list
-        source = _sync_block(
-            source, "_DEFAULT_SERVICES",
-            f"_DEFAULT_SERVICES = {_fmt_pyval(_services)}"
-        )
-        # Sync group settings defaults
-        source = _sync_block(
-            source, "_group_settings_defaults",
-            f"_group_settings = load_json(GROUP_SETTINGS_FILE, {_fmt_pyval(_group_settings)})"
-        )
-
-        with open(bot_file, "w", encoding="utf-8") as f:
-            f.write(source)
-        print("[SYNC] ✅ bot.py auto-patched with latest settings")
-    except Exception as e:
-        print(f"[SYNC] ❌ Failed to patch bot.py: {e}")
-
-
 def save_templates():
     save_json(TEMPLATES_FILE, _templates)
-    _sync_settings_to_botpy()
 
 
 def get_template(key):
@@ -503,14 +466,12 @@ _TEMPLATE_VARS = {
 # ── End Message templates ──────────────────────────────────────────────────────
 
 SERVICES_FILE = "services.json"
-# <<SYNC:_DEFAULT_SERVICES:START>>
 _DEFAULT_SERVICES = [
     {"label": "Instagram →", "key": "instagram"},
     {"label": "Facebook 💎", "key": "facebook"},
     {"label": "WhatsApp", "key": "whatsapp"},
     {"label": "PC Clone 💎", "key": "pc clone"},
 ]
-# <<SYNC:_DEFAULT_SERVICES:END>>
 _services = load_json(SERVICES_FILE, list(_DEFAULT_SERVICES))
 _addservice_state = {}
 _countdowns = {}
@@ -520,15 +481,6 @@ _raw_user_map = load_json(USER_MAP_FILE, {})
 user_map: dict[str, int] = {k: int(v) for k, v in _raw_user_map.items()}
 user_map_lock = threading.Lock()
 assigned_time: dict[str, float] = {}
-
-OTP_STATS_FILE = "otp_stats.json"
-otp_stats: dict[str, int] = load_json(OTP_STATS_FILE, {})
-otp_stats_lock = threading.Lock()
-
-
-def _save_otp_stats():
-    with otp_stats_lock:
-        save_json(OTP_STATS_FILE, otp_stats)
 
 # Tracks last service+country per user so OTP message buttons know what to request
 _user_last_svc: dict[int, tuple] = {}   # uid -> (svc, scnt)
@@ -567,6 +519,11 @@ def _ensure_code_tag(text, value):
     return text.replace(v, f"<code>{v}</code>", 1)
 
 
+def _strip_html(text):
+    """Remove all HTML tags — used as plain-text fallback when template HTML is broken."""
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def _send_with_retry(fn, max_retries=3, **kwargs):
     """Call fn(**kwargs) with up to max_retries on 429 rate-limit errors.
     Returns (result, rate_limit_seconds) tuple:
@@ -597,31 +554,11 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
     svc = service.upper() if service else "—"
     c_name, flag = get_country_details(number)
     otp_str = str(otp)
-    _grp_vars = dict(svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str)
-    _dm_vars  = dict(svc=svc, number=(number if str(number).startswith("+") else "+" + str(number)),
-                     country=c_name, flag=flag, otp=otp_str)
-
-    def _build_message(key, vars_dict):
-        """Return (text, used_default). Falls back to default on any error."""
-        try:
-            txt = get_template(key).format(**vars_dict)
-            return _ensure_code_tag(txt, otp_str), False
-        except Exception as e:
-            print(f"[TEMPLATE] ⚠️ Custom template '{key}' format error, using default: {e}")
-        txt = _DEFAULT_TEMPLATES[key].format(**vars_dict)
-        return _ensure_code_tag(txt, otp_str), True
-
-    def _try_send(label, chat_id, text, markup):
-        """Send message; if Telegram rejects it return (None, err_str)."""
-        try:
-            result, rl = _send_with_retry(bot.send_message,
-                                          chat_id=chat_id, text=text,
-                                          parse_mode="HTML", reply_markup=markup)
-            return result, rl, None
-        except Exception as e:
-            return None, 0, str(e)
-
     if chat_id == get_otp_group_id():
+        message = get_template("otp_group").format(
+            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
+        )
+        message = _ensure_code_tag(message, otp_str)
         markup = types.InlineKeyboardMarkup()
         _btns = []
         if get_bot_link():
@@ -630,25 +567,33 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             _btns.append(types.InlineKeyboardButton("📢 𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", url=get_channel2()))
         if _btns:
             markup.row(*_btns)
-
-        message, used_default = _build_message("otp_group", _grp_vars)
-        sent, rl, err = _try_send("GROUP", chat_id, message, markup)
-
-        # If custom template caused a send error, retry with default
-        if err and not used_default:
-            print(f"[OTP-GROUP] ⚠️ Send failed (custom template HTML error?): {err} — retrying with default")
-            message = _ensure_code_tag(_DEFAULT_TEMPLATES["otp_group"].format(**_grp_vars), otp_str)
-            sent, rl, err = _try_send("GROUP-DEFAULT", chat_id, message, markup)
-
-        if err:
-            print(f"[OTP-GROUP] ❌ Exception sending to group {chat_id}: {err}")
-        elif sent:
-            print(f"[OTP-GROUP] ✅ Sent OTP={otp_str} num={mask_number(number)} svc={svc} to group {chat_id}")
-            if is_auto_delete():
-                _schedule_delete(chat_id, sent.message_id)
-        else:
-            print(f"[OTP-GROUP] ❌ FAILED to send OTP={otp_str} num={mask_number(number)} — rate limited {rl}s")
+        try:
+            sent, rl = _send_with_retry(
+                bot.send_message,
+                chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=markup
+            )
+            if sent:
+                print(f"[OTP-GROUP] ✅ Sent OTP={otp_str} num={mask_number(number)} svc={svc} to group {chat_id}")
+                if is_auto_delete():
+                    _schedule_delete(chat_id, sent.message_id)
+            else:
+                print(f"[OTP-GROUP] ❌ FAILED to send OTP={otp_str} num={mask_number(number)} — rate limited {rl}s")
+        except Exception as e:
+            print(f"[OTP-GROUP] ⚠️ HTML send failed for group {chat_id}: {e} — trying plain text fallback")
+            try:
+                plain = _strip_html(message)
+                sent2 = bot.send_message(chat_id=chat_id, text=plain, reply_markup=markup)
+                print(f"[OTP-GROUP] ✅ Plain-text fallback OK OTP={otp_str} to group {chat_id}")
+                if sent2 and is_auto_delete():
+                    _schedule_delete(chat_id, sent2.message_id)
+            except Exception as e2:
+                print(f"[OTP-GROUP] ❌ Plain-text fallback ALSO failed for group {chat_id}: {e2}")
     else:
+        message = get_template("otp_dm").format(
+            svc=svc, number=mask_number(number), country=c_name, flag=flag, otp=otp_str
+        )
+        message = _ensure_code_tag(message, otp_str)
+        # Build action buttons using user's last known service/country
         uid = chat_id  # DM: chat_id == user_id
         last_svc_info = _user_last_svc.get(uid)
         dm_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -662,7 +607,6 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             dm_markup.add(
                 types.InlineKeyboardButton("📢 𝗢𝗧𝗣 𝗚𝗿𝗼𝘂𝗽", url=get_otp_group_link()),
             )
-
         # Delete the previous "Number Assigned" message when OTP arrives
         prev_msg_id = _user_last_num_msg.get(uid)
         if prev_msg_id:
@@ -671,24 +615,27 @@ def send_otp_message(chat_id, otp, number, seconds, service=""):
             except Exception:
                 pass
             _user_last_num_msg.pop(uid, None)
-
-        message, used_default = _build_message("otp_dm", _dm_vars)
-        result, rl, err = _try_send("DM", chat_id, message, dm_markup)
-
-        # If custom template caused a send error, retry with default
-        if err and not used_default:
-            print(f"[OTP-DM] ⚠️ Send failed (custom template HTML error?): {err} — retrying with default")
-            message = _ensure_code_tag(_DEFAULT_TEMPLATES["otp_dm"].format(**_dm_vars), otp_str)
-            result, rl, err = _try_send("DM-DEFAULT", chat_id, message, dm_markup)
-
-        if err:
-            print(f"[OTP-DM] ❌ Exception sending to user {chat_id}: {err}")
-        elif result:
-            print(f"[OTP-DM] ✅ Sent OTP={otp_str} to user {chat_id}")
-            # Do NOT store OTP message in _user_last_num_msg —
-            # that tracker is only for "Number Assigned" messages
-        else:
-            print(f"[OTP-DM] ❌ FAILED to send OTP={otp_str} to user {chat_id} — rate limited {rl}s")
+        try:
+            result, rl = _send_with_retry(
+                bot.send_message,
+                chat_id=chat_id, text=message, parse_mode="HTML", reply_markup=dm_markup
+            )
+            if result:
+                print(f"[OTP-DM] ✅ Sent OTP={otp_str} to user {chat_id}")
+                # Remember this message so its buttons can be stripped next time
+                _user_last_num_msg[uid] = result.message_id
+            else:
+                print(f"[OTP-DM] ❌ FAILED to send OTP={otp_str} to user {chat_id} — rate limited {rl}s")
+        except Exception as e:
+            print(f"[OTP-DM] ⚠️ HTML send failed for user {chat_id}: {e} — trying plain text fallback")
+            try:
+                plain = _strip_html(message)
+                result2 = bot.send_message(chat_id=chat_id, text=plain, reply_markup=dm_markup)
+                print(f"[OTP-DM] ✅ Plain-text fallback OK OTP={otp_str} to user {chat_id}")
+                if result2:
+                    _user_last_num_msg[uid] = result2.message_id
+            except Exception as e2:
+                print(f"[OTP-DM] ❌ Plain-text fallback ALSO failed for user {chat_id}: {e2}")
 
 
 def _dispatch_otp(otp, number, seconds, service=""):
@@ -703,10 +650,9 @@ def _dispatch_otp(otp, number, seconds, service=""):
         print(f"[DISPATCH] ⚠️ No OTP group configured — skipping group send!")
     if uid:
         send_otp_message(uid, otp, number, seconds, service)
-        # Track OTP receive count per user
-        with otp_stats_lock:
-            otp_stats[str(uid)] = otp_stats.get(str(uid), 0) + 1
-        _save_otp_stats()
+        with _otp_counts_lock:
+            _otp_counts[str(uid)] = _otp_counts.get(str(uid), 0) + 1
+            save_json(OTP_COUNTS_FILE, _otp_counts)
         # Auto-release: number এ OTP আসলে সাথে সাথে delete হয়ে যাবে
         with user_map_lock:
             user_map.pop(clean, None)
@@ -798,6 +744,14 @@ _p6_session = None
 _p6_sesskey = None
 _p6_lock = threading.Lock()
 
+_p7_session = None
+_p7_sesskey = None
+_p7_lock = threading.Lock()
+
+_p8_session = None
+_p8_sesskey = None
+_p8_lock = threading.Lock()
+
 
 # ── Panel stats (for /panels command) ─────────────────────────────────────────
 _panel_stats = {
@@ -849,6 +803,22 @@ _panel_stats = {
         "last": None,
         "errors": 0,
     },
+    "p7": {
+        "name": "Rabbi12_P7",
+        "host": "54.36.173.235",
+        "status": "⏳",
+        "count": 0,
+        "last": None,
+        "errors": 0,
+    },
+    "p8": {
+        "name": "Rabbi5",
+        "host": "54.39.104.241",
+        "status": "⏳",
+        "count": 0,
+        "last": None,
+        "errors": 0,
+    },
 }
 _stats_lock = threading.Lock()
 
@@ -879,6 +849,45 @@ _demo_svc_state: dict = {}
 _demo_cfg_temp: dict = {}
 
 seen_lock = threading.Lock()
+
+# ── OTP Dispatch Queue (prevents monitor threads from blocking on Telegram sends) ──
+import queue as _queue_mod
+_otp_dispatch_queue = _queue_mod.Queue()
+
+def _otp_dispatch_worker():
+    while True:
+        try:
+            item = _otp_dispatch_queue.get(timeout=10)
+            if item is None:
+                continue
+            otp, number, seconds, service = item
+            try:
+                _dispatch_otp(otp, number, seconds, service)
+            except Exception as e:
+                print(f"[OTP-WORKER] Dispatch error: {e}")
+        except _queue_mod.Empty:
+            continue
+        except Exception as e:
+            print(f"[OTP-WORKER] Worker error: {e}")
+        finally:
+            try:
+                _otp_dispatch_queue.task_done()
+            except Exception:
+                pass
+
+for _i in range(12):
+    threading.Thread(target=_otp_dispatch_worker, daemon=True).start()
+
+_seen_save_counter = 0
+_seen_save_lock = threading.Lock()
+
+def _maybe_save_seen():
+    global _seen_save_counter
+    with _seen_save_lock:
+        _seen_save_counter += 1
+        if _seen_save_counter >= 5:
+            _seen_save_counter = 0
+            save_json(SEEN_FILE, seen_otps)
 
 # ── Dynamic panel system ───────────────────────────────────────────────────────
 DYNAMIC_PANELS_FILE = "dynamic_panels.json"
@@ -914,7 +923,6 @@ _migrate_dynamic_panels()
 
 def save_dynamic_panels():
     save_json(DYNAMIC_PANELS_FILE, _dynamic_panels)
-    _sync_settings_to_botpy()
 
 
 def _get_dp_lock(pid):
@@ -952,18 +960,13 @@ _SIGNIN_PATHS = [
 # All known data endpoints: (path, param_style, engine_name)
 # param_style: "ints" or "xisora"
 _DATA_ENDPOINTS = [
-    ("/agent/res/data_smscdr.php",              "ints",   "ints_smscdr"),
-    ("/agent/res/data_smsranges.php",            "ints",   "ints_smsranges"),
-    ("/agent/res/data_smscdrreports.php",        "ints",   "ints_smscdr"),
-    ("/ints/agent/res/data_smscdr.php",          "ints",   "ints_smscdr"),
-    ("/ints/agent/res/data_smsranges.php",       "ints",   "ints_smsranges"),
-    ("/sms/agent/res/data_smscdr.php",           "ints",   "ints_smscdr"),
-    ("/sms/agent/res/data_smsranges.php",        "ints",   "ints_smsranges"),
-    ("/konekta/agent/res/data_smscdr.php",       "ints",   "ints_smscdr"),
-    ("/konekta/agent/res/data_smsranges.php",    "ints",   "ints_smsranges"),
-    ("/client/ajax/dt_reports.php",              "xisora", "xisora"),
-    ("/client/ajax/dt_smscdr.php",               "xisora", "xisora"),
-    ("/api/sms/cdr",                             "ints",   "ints_smscdr"),
+    # Paths relative to base_url (base_url already contains prefix like /ints, /konekta etc.)
+    ("/agent/res/data_smscdr.php",       "ints",   "ints_smscdr"),
+    ("/agent/res/data_smsranges.php",    "ints",   "ints_smsranges"),
+    ("/agent/res/data_smscdrreports.php","ints",   "ints_smscdr"),
+    ("/client/ajax/dt_reports.php",      "xisora", "xisora"),
+    ("/client/ajax/dt_smscdr.php",       "xisora", "xisora"),
+    ("/api/sms/cdr",                     "ints",   "ints_smscdr"),
 ]
 
 # Dashboard pages to probe for sesskey/csstr token
@@ -1006,38 +1009,81 @@ def _univ_build_url(base_endpoint: str, token: str, date_str: str, style: str) -
         f"&frange=&fclient=&fnum=&fcli=&fgdate=&fgmonth="
         f"&fgrange=&fgclient=&fgnumber=&fgcli=&fg=0"
     )
-    # Only append sesskey when token is actually present (cookie-based panels don't need it)
+    # Send both sesskey AND csstr so panels using either token type work correctly
     if token:
-        base_q += f"&sesskey={token}"
+        base_q += f"&sesskey={token}&csstr={token}"
     return base_q
 
 
 def _univ_extract_token(html: str) -> str:
-    sk = re.search(r"sesskey=([A-Za-z0-9+/=]+)", html)
+    # 1. sesskey in URL query string: sesskey=VALUE
+    sk = re.search(r"sesskey=([A-Za-z0-9+/=%_-]{6,})", html)
     if sk:
-        return sk.group(1)
+        val = sk.group(1).rstrip("&\"'")
+        if val:
+            return val
+    # 2. JavaScript variable: var sesskey = "VALUE" / sesskey:"VALUE" / sesskey = 'VALUE'
+    js = re.search(
+        r'''["\s]sesskey["']?\s*[=:]\s*["']([A-Za-z0-9+/=%_-]{6,})["']''',
+        html, re.IGNORECASE
+    )
+    if js:
+        return js.group(1)
+    # 3. Hidden input: name="sesskey" value="VALUE" (any order)
+    hi = re.search(
+        r'''<input[^>]+name=["']sesskey["'][^>]+value=["']([^"']+)["']'''
+        r'''|<input[^>]+value=["']([^"']+)["'][^>]+name=["']sesskey["']''',
+        html, re.IGNORECASE
+    )
+    if hi:
+        return hi.group(1) or hi.group(2)
+    # 4. csstr token: csstr=VALUE
     cs = re.search(r"csstr=([a-f0-9]{16,})", html)
     if cs:
         return cs.group(1)
+    # 5. JSON field: "token":"VALUE" or "auth_token":"VALUE"
+    tk = re.search(
+        r'"(?:token|auth_token|access_token|api_key)"\s*:\s*"([A-Za-z0-9+/=_-]{10,})"',
+        html, re.IGNORECASE
+    )
+    if tk:
+        return tk.group(1)
     return ""
 
 
 def _univ_is_login_page(url: str, text: str) -> bool:
     """Return True if response looks like still-on-login-page."""
     u = (url or "").lower()
-    t = (text or "").lower()[:800]
+    t_full = (text or "").lower()
+    t = t_full[:800]
+    # Error messages visible in the page text
     if any(w in t for w in ("invalid password", "incorrect password", "wrong password",
                              "login failed", "invalid username", "invalid credentials",
                              "authentication failed", "wrong credentials",
                              "username or password")):
         return True
-    # Login form still visible = still on login page
-    if "type=\"password\"" in (text or "").lower() and len(text) < 700:
+    # URL path strongly suggests login page
+    url_is_login = any(w in u for w in ("/login", "/signin", "/signmein", "/sign-in", "/sign_in"))
+    # Page has a password input field (login form present)
+    has_password_field = 'type="password"' in t_full or "type='password'" in t_full
+    # Page title contains login-related words
+    title_m = re.search(r'<title[^>]*>([^<]{1,80})</title>', text or "", re.IGNORECASE)
+    title_has_login = False
+    if title_m:
+        title_lower = title_m.group(1).lower()
+        title_has_login = any(w in title_lower for w in ("login", "sign in", "signin", "sign-in"))
+    # Small page on login URL = almost certainly a login page
+    if url_is_login and len(text) < 1200:
         return True
-    # URL still looks like a login/sign-in page (catches /sign-in with hyphen too)
-    if any(w in u for w in ("/login", "/signin", "/signmein", "/sign-in", "/sign_in")):
-        if len(text) < 1200:
-            return True
+    # Login URL + password field = definitely login page (catches large modern login pages)
+    if url_is_login and has_password_field:
+        return True
+    # Login URL + title says Login = login page
+    if url_is_login and title_has_login:
+        return True
+    # Title says Login + has password field (even without /login in URL)
+    if title_has_login and has_password_field:
+        return True
     return False
 
 
@@ -1235,25 +1281,39 @@ def _universal_login(panel):
             rp = logged_sess.get(scrape_url, timeout=10, verify=False)
             if rp.status_code != 200:
                 continue
+            if _univ_is_login_page(rp.url, rp.text):
+                continue
             pg = rp.text
-            # Look for ajax/url patterns pointing to data PHP files
+            # Also try to extract sesskey from the page (in case Step 4 missed it)
+            if not token:
+                tok_candidate = _univ_extract_token(pg)
+                if tok_candidate:
+                    token = tok_candidate
+                    print(f"[{pid}] 🔑 Found token in {scrape_url}: {token[:10]}...")
+            # Look for ajax/url patterns pointing to data PHP files (capture full URL incl query)
             for m in re.finditer(
-                r'''["']([^"']*(?:data_sms|dt_reports|dt_sms|cdr|reports)[^"']*\.php)['"''',
+                r'''["']([^"']*(?:data_sms|dt_reports|dt_sms|cdr|reports)[^"']*\.php(?:\?[^"']*)?)['"''',
                 pg, re.IGNORECASE
             ):
-                raw = m.group(1)
-                # Convert to absolute URL
-                if raw.startswith("http"):
-                    abs_ep = raw
-                elif raw.startswith("/"):
+                raw_full = m.group(1)         # may include ?param=val&sesskey=XXX
+                raw_path = raw_full.split("?")[0]  # just the .php path
+                # Extract sesskey from the full AJAX URL if present
+                sk_in_url = re.search(r"sesskey=([A-Za-z0-9+/=%_-]{6,})", raw_full)
+                if sk_in_url and not token:
+                    token = sk_in_url.group(1).rstrip("&\"'")
+                    print(f"[{pid}] 🔑 sesskey from AJAX URL: {token[:10]}...")
+                # Convert path to absolute URL
+                if raw_path.startswith("http"):
+                    abs_ep = raw_path
+                elif raw_path.startswith("/"):
                     parsed_host = re.match(r"(https?://[^/]+)", scrape_url)
-                    abs_ep = (parsed_host.group(1) if parsed_host else base) + raw
+                    abs_ep = (parsed_host.group(1) if parsed_host else base) + raw_path
                 else:
-                    abs_ep = base + "/" + raw.lstrip("/")
-                style = "xisora" if "dt_reports" in raw or "dt_sms" in raw else "ints"
+                    abs_ep = base + "/" + raw_path.lstrip("/")
+                style = "xisora" if "dt_reports" in raw_path or "dt_sms" in raw_path else "ints"
                 eng = "xisora" if style == "xisora" else "ints_smscdr"
-                scraped_ep_candidates.append((abs_ep, raw, style, eng))
-                print(f"[{pid}] 🔎 Scraped data URL from {scrape_url}: {raw}")
+                scraped_ep_candidates.append((abs_ep, raw_path, style, eng))
+                print(f"[{pid}] 🔎 Scraped data URL from {scrape_url}: {raw_path}")
         except Exception:
             continue
 
@@ -1703,51 +1763,21 @@ def fetch_panel2():
 # ── Shared OTP processor ──────────────────────────────────────────────────────
 
 
-_seen_dirty = False
-_seen_dirty_lock = threading.Lock()
-
-
-def _seen_saver():
-    """Background thread: flush seen_otps to disk at most once every 30 seconds,
-    and trim the dict if it grows beyond 50 000 entries to keep saves fast."""
-    global seen_otps, _seen_dirty
-    MAX_SEEN = 50_000
-    while True:
-        time.sleep(30)
-        with _seen_dirty_lock:
-            if not _seen_dirty:
-                continue
-            _seen_dirty = False
-        with seen_lock:
-            if len(seen_otps) > MAX_SEEN:
-                keys = list(seen_otps.keys())
-                seen_otps = {k: True for k in keys[-MAX_SEEN:]}
-            snapshot = dict(seen_otps)
-        try:
-            save_json(SEEN_FILE, snapshot)
-        except Exception as e:
-            print(f"[SEEN-SAVER] Save error: {e}")
-
-
-threading.Thread(target=_seen_saver, daemon=True, name="seen-saver").start()
-
-
 def process_new_otps(current):
-    global seen_otps, _seen_dirty
+    global seen_otps
     for key, (number, otp, sms_txt, service) in current.items():
         with seen_lock:
             if key in seen_otps:
                 continue
             seen_otps[key] = True
-        with _seen_dirty_lock:
-            _seen_dirty = True
+        _maybe_save_seen()
         clean = re.sub(r"\D", "", str(number))
         with user_map_lock:
             t_start = assigned_time.get(clean)
         seconds = int(time.time() - t_start) if t_start else 0
-        _dispatch_otp(otp, number, seconds, service)
+        _otp_dispatch_queue.put((otp, number, seconds, service))
         print(
-            f"[MONITOR] ✅ Forwarded OTP={otp} for {number} ({service}) in {seconds}s"
+            f"[MONITOR] ✅ Queued OTP={otp} for {number} ({service}) in {seconds}s"
         )
 
 
@@ -2239,6 +2269,121 @@ def panel6_monitor():
         time.sleep(POLL_INTERVAL)
 
 
+# ── Panel 7 & 8 — use universal engine (same as dynamic panels) ───────────────
+# These panels are hardcoded but processed through _start_dynamic_panel so
+# _universal_login handles captcha, POST path detection, token extraction, etc.
+
+_HARDCODED_EXTRA_PANELS = [
+    {
+        "id": "p7",
+        "host": "54.36.173.235",
+        "base_url": "http://54.36.173.235/ints",
+        "url_hint": "http://54.36.173.235/ints/agent/SMSCDRStats",
+        "username": "Rabbi12",
+        "password": "Rabbi@",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p8",
+        "host": "54.39.104.241",
+        "base_url": "http://54.39.104.241/ints",
+        "url_hint": "http://54.39.104.241/ints/agent/SMSCDRStats",
+        "username": "Rabbi5",
+        "password": "Rabbi5",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p9",
+        "host": "139.99.69.196",
+        "base_url": "http://139.99.69.196/ints",
+        "url_hint": "http://139.99.69.196/ints/agent/SMSCDRStats",
+        "username": "Mahofuza12",
+        "password": "Mahofuza12",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p10",
+        "host": "139.99.9.4",
+        "base_url": "http://139.99.9.4/ints",
+        "url_hint": "http://139.99.9.4/ints/agent/SMSCDRStats",
+        "username": "Rabbi12",
+        "password": "Rabbi12",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p11",
+        "host": "213.32.24.208",
+        "base_url": "http://213.32.24.208/ints",
+        "url_hint": "http://213.32.24.208/ints/agent/SMSCDRStats",
+        "username": "mahofuza",
+        "password": "mahofuza@",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p12",
+        "host": "15.235.182.3",
+        "base_url": "http://15.235.182.3/konekta",
+        "url_hint": "http://15.235.182.3/konekta/agent/SMSCDRReports",
+        "username": "Rabbi200",
+        "password": "Rabbi200",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p13",
+        "host": "nexor-iprn.com",
+        "base_url": "https://nexor-iprn.com",
+        "url_hint": "https://nexor-iprn.com/agent/SMSCDRStats",
+        "username": "Rabbi12",
+        "password": "Rabbi12@",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p14",
+        "host": "51.77.52.79",
+        "base_url": "http://51.77.52.79/ints",
+        "url_hint": "http://51.77.52.79/ints/agent/SMSCDRStats",
+        "username": "Rabbi12",
+        "password": "Rabbi12",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+    {
+        "id": "p15",
+        "host": "51.210.208.26",
+        "base_url": "http://51.210.208.26/ints",
+        "url_hint": "http://51.210.208.26/ints/agent/SMSCDRStats",
+        "username": "Dasbabu50_FD",
+        "password": "Dasbabu50_FD",
+        "engine": "ints_smscdr",
+        "data_path": "/agent/res/data_smscdr.php",
+        "admin_id": None,
+    },
+]
+
+
+def panel7_monitor():
+    pass
+
+
+def panel8_monitor():
+    pass
+
+
 # ── Demo OTP monitor ──────────────────────────────────────────────────────────
 
 
@@ -2318,10 +2463,77 @@ def demo_menu_markup():
 # ── Menus ─────────────────────────────────────────────────────────────────────
 
 
+def _otp_status_inline_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔄 Reset (সব শূন্য করো)", callback_data="otp_status_reset"
+        )
+    )
+    return markup
+
+
+def _send_otp_status_msg(chat_id, edit_msg_id=None):
+    with _otp_counts_lock:
+        counts = dict(_otp_counts)
+    if not counts:
+        text = (
+            "📈 <b>OTP STATUS</b>\n\n"
+            "<i>এখনো কোনো OTP রেকর্ড নেই।</i>"
+        )
+    else:
+        sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        lines = (
+            "📈 <b>OTP STATUS — প্রতিটি ইউজার কত OTP পেয়েছে</b>\n"
+            "⚡━━━━━━━━━━━━━━━━━━━━⚡\n\n"
+        )
+        for rank, (uid_str, cnt) in enumerate(sorted_counts, 1):
+            name = user_names.get(uid_str, f"ID:{uid_str}")
+            lines += f"{rank}. 👤 <b>{name}</b> — <code>{cnt}</code> OTP\n"
+        lines += (
+            f"\n⚡━━━━━━━━━━━━━━━━━━━━⚡\n"
+            f"📊 মোট ইউজার: <b>{len(sorted_counts)}</b>"
+        )
+        text = lines
+    markup = _otp_status_inline_markup()
+    if edit_msg_id:
+        try:
+            bot.edit_message_text(
+                text, chat_id, edit_msg_id,
+                reply_markup=markup, parse_mode="HTML"
+            )
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def _send_leaderboard(message):
+    with _otp_counts_lock:
+        counts = dict(_otp_counts)
+    if not counts:
+        bot.send_message(
+            message.chat.id,
+            "🏆 <b>LEADERBOARD</b>\n\n<i>এখনো কোনো OTP রেকর্ড নেই।</i>",
+            parse_mode="HTML",
+        )
+        return
+    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = "🏆 <b>TOP 10 LEADERBOARD</b> 🏆\n⚡━━━━━━━━━━━━━━━━━━━━⚡\n\n"
+    for i, (uid_str, cnt) in enumerate(sorted_counts):
+        medal = medals[i] if i < len(medals) else f"{i + 1}."
+        name = user_names.get(uid_str, f"User #{uid_str}")
+        lines += f"{medal} <b>{name}</b>\n    📩 <code>{cnt}</code> OTP রিসিভ\n\n"
+    lines += "⚡━━━━━━━━━━━━━━━━━━━━⚡"
+    bot.send_message(message.chat.id, lines, parse_mode="HTML")
+
+
 def main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(types.KeyboardButton("☎️ 𝗡𝗨𝗠𝗕𝗔𝗥 ☎️"))
     markup.add(types.KeyboardButton("📊 𝗦𝗧𝗢𝗖𝗞"), types.KeyboardButton("📞 𝗦𝗔𝗣𝗢𝗥𝗧"))
+    markup.add(types.KeyboardButton("🏆 𝗟𝗲𝗮𝗱𝗲𝗿𝗯𝗼𝗮𝗿𝗱"))
     if user_id in ADMIN_IDS:
         markup.add(types.KeyboardButton("⚙️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟 ⚙️"))
     return markup
@@ -2329,7 +2541,6 @@ def main_menu(user_id):
 
 def save_services():
     save_json(SERVICES_FILE, _services)
-    _sync_settings_to_botpy()
 
 
 def _get_svc_map():
@@ -2372,7 +2583,7 @@ def show_countries(chat_id, svc):
     )
     bot.send_message(
         chat_id,
-        f"🌍 <b>Country select koro:</b>",
+        f"🔥 <b>{svc.upper()} — COUNTRY SELECT</b> 🔥",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -2434,7 +2645,8 @@ def panels_cmd(message):
     with _stats_lock:
         stats = {k: dict(v) for k, v in _panel_stats.items()}
     lines = ""
-    for pid in ["p1", "p2", "p3", "p4", "p5", "p6"]:
+    for pid in ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8",
+                "p9", "p10", "p11", "p12", "p13", "p14", "p15"]:
         s = stats.get(pid, {})
         if s.get("last"):
             ago = int(time.time() - s["last"])
@@ -3088,6 +3300,9 @@ def callback_handler(call):
                         parse_mode="HTML",
                     )
             else:
+                with _verified_users_lock:
+                    _verified_users.add(uid)
+                _save_verified_users()
                 bot.delete_message(call.message.chat.id, call.message.message_id)
                 vname = call.from_user.first_name or call.from_user.username or "User"
                 bot.send_message(
@@ -3133,7 +3348,7 @@ def callback_handler(call):
                 save_stock()
                 c_name, flag = get_country_details(num)
                 uid_n = call.from_user.id
-                # Release any previously assigned number for this user — delete it permanently
+                # Release any previously assigned number for this user
                 with user_map_lock:
                     old_nums = [k for k, v in user_map.items() if v == uid_n]
                     for old_clean in old_nums:
@@ -3141,7 +3356,7 @@ def callback_handler(call):
                         assigned_time.pop(old_clean, None)
                 if old_nums:
                     _save_user_map()
-                    print(f"[N:] Deleted old number(s) {old_nums} for user {uid_n}")
+                    print(f"[N:] Released old number(s) {old_nums} for user {uid_n} before new assignment")
                 register_number(call.message.chat.id, num)
                 display_num = num if num.startswith("+") else "+" + num
                 init_kb = types.InlineKeyboardMarkup(row_width=2)
@@ -3158,37 +3373,17 @@ def callback_handler(call):
                 )
                 # Track service/country for this user so OTP message buttons work
                 _user_last_svc[uid_n] = (svc, scnt)
-                tracked_num_msg = _user_last_num_msg.get(uid_n)
-                clicked_msg_id = call.message.message_id
-                if tracked_num_msg and clicked_msg_id == tracked_num_msg:
-                    # Clicked from "Number Assigned" message → delete it
-                    try:
-                        bot.delete_message(
-                            chat_id=call.message.chat.id,
-                            message_id=clicked_msg_id,
-                        )
-                    except Exception:
-                        pass
-                else:
-                    # Clicked from OTP code message → keep it, only strip buttons
-                    try:
-                        bot.edit_message_reply_markup(
-                            chat_id=call.message.chat.id,
-                            message_id=clicked_msg_id,
-                            reply_markup=None,
-                        )
-                    except Exception:
-                        pass
-                    # Delete any separately tracked "Number Assigned" message
-                    if tracked_num_msg:
-                        try:
-                            bot.delete_message(
-                                chat_id=call.message.chat.id,
-                                message_id=tracked_num_msg,
-                            )
-                        except Exception:
-                            pass
-                # Send fresh number-assigned message
+                # Strip buttons from the current message (OTP msg or previous number msg)
+                # — the message itself stays, only its inline buttons are removed
+                try:
+                    bot.edit_message_reply_markup(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                # Send a brand-new number-assigned message (don't overwrite OTP message)
                 new_msg = bot.send_message(
                     call.message.chat.id,
                     res,
@@ -3652,6 +3847,73 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "✅ Group removed!")
             _show_settings_inline(call)
 
+        elif data == "otp_status_reset":
+            if call.from_user.id not in ADMIN_IDS:
+                return
+            with _otp_counts_lock:
+                _otp_counts.clear()
+                save_json(OTP_COUNTS_FILE, _otp_counts)
+            bot.answer_callback_query(call.id, "✅ OTP counts reset হয়েছে!")
+            _send_otp_status_msg(
+                call.message.chat.id,
+                edit_msg_id=call.message.message_id,
+            )
+
+        elif data.startswith("tmpl_confirm:"):
+            if call.from_user.id not in ADMIN_IDS:
+                return
+            uid = call.from_user.id
+            key = data[len("tmpl_confirm:"):]
+            state = _edit_template_state.pop(uid, None)
+            pending = state.get("pending", "") if state else ""
+            if not pending:
+                bot.answer_callback_query(call.id, "❌ কোনো pending template নেই।", show_alert=True)
+                return
+            _templates[key] = pending
+            save_templates()
+            label = _TEMPLATE_LABELS.get(key, key)
+            try:
+                bot.edit_message_text(
+                    f"✅🔥 <b>সেভ হয়েছে!</b>\n\n✏️ <b>{label}</b>\n\nফরমেট সফলভাবে আপডেট হয়েছে।",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id, "✅ Template সেভ হয়েছে!")
+
+        elif data.startswith("tmpl_reedit:"):
+            if call.from_user.id not in ADMIN_IDS:
+                return
+            uid = call.from_user.id
+            key = data[len("tmpl_reedit:"):]
+            _edit_template_state.pop(uid, None)
+            label = _TEMPLATE_LABELS.get(key, key)
+            vars_hint = _TEMPLATE_VARS.get(key, "")
+            current = get_template(key)
+            _edit_template_state[uid] = {"key": key}
+            try:
+                bot.edit_message_text(
+                    "❌ <b>বাতিল।</b> নতুন ফরমেট পাঠাও:",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            msg = bot.send_message(
+                call.message.chat.id,
+                f"✏️ <b>{label}</b>\n\n"
+                f"📌 <b>ভেরিয়েবল:</b>\n<code>{vars_hint}</code>\n\n"
+                f"📄 <b>বর্তমান ফরমেট:</b>\n<code>{current[:500]}</code>\n\n"
+                f"⬇️ <b>নতুন ফরমেট লিখো:</b>",
+                reply_markup=_back_admin_kb(),
+                parse_mode="HTML",
+            )
+            bot.register_next_step_handler(msg, _save_new_template)
+            bot.answer_callback_query(call.id)
+
     except Exception as e:
         print(f"Callback Error: {e}")
 
@@ -3979,6 +4241,11 @@ def text_handler(message):
     txt = message.text
     register_user(message.chat.id)
 
+    # ── Verification gate ─────────────────────────────────────────────────────
+    if not _is_verified(uid):
+        _send_join_prompt(message.chat.id)
+        return
+
     if txt == "☎️ 𝗡𝗨𝗠𝗕𝗔𝗥 ☎️":
         show_services(message)
 
@@ -4002,17 +4269,25 @@ def text_handler(message):
         )
 
     elif txt == "📞 𝗦𝗔𝗣𝗢𝗥𝗧":
+        support_raw = (_group_settings.get("support_id", "") or "").strip()
+        if support_raw.startswith("https://t.me/") or support_raw.startswith("http://t.me/"):
+            support_url = support_raw
+        elif support_raw.startswith("@"):
+            support_url = f"https://t.me/{support_raw[1:]}"
+        elif re.match(r"^\w+$", support_raw) and support_raw:
+            support_url = f"https://t.me/{support_raw}"
+        else:
+            support_url = ""
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("📩 Support Team", url="https://t.me/Tom_9805")
-        )
+        if support_url:
+            markup.add(types.InlineKeyboardButton("📩 Support Team", url=support_url))
         bot.send_message(
             message.chat.id,
             "📞 <b>SUPPORT</b> 📞\n"
             "⚡━━━━━━━━━━━━━━⚡\n\n"
             "Kono somossa hole nicher button e click koro!\n\n"
             "⚡━━━━━━━━━━━━━━⚡",
-            reply_markup=markup,
+            reply_markup=markup if support_url else None,
             parse_mode="HTML",
         )
 
@@ -4023,6 +4298,12 @@ def text_handler(message):
             report += f" <b>{s.upper()}</b>: {total} টি \n"
         report += "\n⚡━━━━━━━━━━━━⚡\n🤖 <b>AR OTP BOT</b> 🔥"
         bot.send_message(message.chat.id, report, parse_mode="HTML")
+
+    elif txt == "🏆 𝗟𝗲𝗮𝗱𝗲𝗿𝗯𝗼𝗮𝗿𝗱":
+        _send_leaderboard(message)
+
+    elif txt == "📈 𝗢𝗧𝗣 𝗦𝘁𝗮𝘁𝘂𝘀" and uid in ADMIN_IDS:
+        _send_otp_status_msg(message.chat.id)
 
     elif txt == "⚙️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟 ⚙️" and uid in ADMIN_IDS:
         _go_admin_panel(message)
@@ -4094,45 +4375,8 @@ def text_handler(message):
                     name = user_names.get(str(user_id), "—")
                     lines += f"{i}. 🆔 <code>{user_id}</code>\n    👤 {name}\n\n"
                 bot.send_message(message.chat.id, lines, parse_mode="HTML")
-
-    elif txt == "📈 𝗢𝗧𝗣 𝗦𝘁𝗮𝘁𝘀" and uid in ADMIN_IDS:
-        with otp_stats_lock:
-            stats_copy = dict(otp_stats)
-        if not stats_copy:
-            bot.send_message(
-                message.chat.id,
-                "📈 <b>OTP STATS</b>\n\n"
-                "⚠️ এখনো কোনো OTP ডেলিভার হয়নি।",
-                parse_mode="HTML",
-            )
-        else:
-            sorted_stats = sorted(stats_copy.items(), key=lambda x: x[1], reverse=True)
-            total_otps = sum(stats_copy.values())
-            PAGE = 30
-            chunks = [sorted_stats[i:i+PAGE] for i in range(0, len(sorted_stats), PAGE)]
-            for idx, chunk in enumerate(chunks):
-                lines = (
-                    f"📈 <b>OTP STATS</b>\n"
-                    f"⚡━━━━━━━━━━━━━━━━⚡\n"
-                    f"📊 মোট OTP ডেলিভার: <b>{total_otps}</b> টি"
-                    + (f"  |  Page {idx+1}/{len(chunks)}" if len(chunks) > 1 else "")
-                    + f"\n👥 মোট ইউজার: <b>{len(sorted_stats)}</b> জন\n"
-                    f"⚡━━━━━━━━━━━━━━━━⚡\n\n"
-                )
-                for rank, (user_id, count) in enumerate(chunk, start=idx*PAGE+1):
-                    name = user_names.get(str(user_id), "")
-                    if not name or str(name).strip().lstrip("-").isdigit():
-                        try:
-                            chat_info = bot.get_chat(int(user_id))
-                            full = f"{chat_info.first_name or ''} {chat_info.last_name or ''}".strip()
-                            uname = chat_info.username or ""
-                            name = f"{full} (@{uname})" if full and uname else (full or f"@{uname}" if uname else str(user_id))
-                            user_names[str(user_id)] = name
-                        except Exception:
-                            name = str(user_id)
-                    medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
-                    lines += f"{medal} <code>{user_id}</code> — <b>{count}</b> টি OTP\n    👤 {name}\n\n"
-                bot.send_message(message.chat.id, lines, parse_mode="HTML")
+                if idx < len(chunks) - 1:
+                    time.sleep(0.5)
 
     elif txt == "➕ 𝗡𝘂𝗺𝗯𝗮𝗿 𝗔𝗱𝗱" and uid in ADMIN_IDS:
         m = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -4632,105 +4876,68 @@ def do_broadcast(message):
         lambda m: make_broadcast_msg(m.caption) if m.caption else make_broadcast_msg("")
     )
 
-    status_msg = bot.send_message(
+    bot.send_message(
         message.chat.id,
-        f"⏳🔥 <b>{len(users)} জনকে পাঠানো হচ্ছে... Background-e চলছে!</b> 🔥⏳",
+        f"⏳🔥 <b>{len(users)} জনকে পাঠানো হচ্ছে...</b> 🔥⏳",
+        parse_mode="HTML",
+    )
+
+    success, fail = 0, 0
+    for uid in list(users):
+        try:
+            if has_photo:
+                bot.send_photo(
+                    uid,
+                    message.photo[-1].file_id,
+                    caption=cap(message),
+                    parse_mode="HTML",
+                )
+            elif has_animation:
+                bot.send_animation(
+                    uid,
+                    message.animation.file_id,
+                    caption=cap(message),
+                    parse_mode="HTML",
+                )
+            elif has_video:
+                bot.send_video(
+                    uid, message.video.file_id, caption=cap(message), parse_mode="HTML"
+                )
+            elif has_video_note:
+                bot.send_video_note(uid, message.video_note.file_id)
+            elif has_sticker:
+                bot.send_sticker(uid, message.sticker.file_id)
+            elif has_audio:
+                bot.send_audio(
+                    uid, message.audio.file_id, caption=cap(message), parse_mode="HTML"
+                )
+            elif has_voice:
+                bot.send_voice(
+                    uid, message.voice.file_id, caption=cap(message), parse_mode="HTML"
+                )
+            elif has_document:
+                bot.send_document(
+                    uid,
+                    message.document.file_id,
+                    caption=cap(message),
+                    parse_mode="HTML",
+                )
+            else:
+                bot.send_message(
+                    uid, make_broadcast_msg(message.text), parse_mode="HTML"
+                )
+            success += 1
+        except Exception:
+            fail += 1
+
+    bot.send_message(
+        message.chat.id,
+        f" <b>BROADCAST COMPLETE!</b> \n\n"
+        f"✅ <b>𝗦𝗼𝗳𝗼𝗹:</b> {success} জন 🔥\n"
+        f"❌ <b>𝗕𝗮𝗿𝘁𝗵𝗼:</b> {fail} জন ",
         parse_mode="HTML",
     )
     _go_admin_panel(message)
-
-    admin_chat_id = message.chat.id
-    target_users = list(users)
-
-    snapshot_has_photo = has_photo
-    snapshot_has_animation = has_animation
-    snapshot_has_video = has_video
-    snapshot_has_video_note = has_video_note
-    snapshot_has_sticker = has_sticker
-    snapshot_has_audio = has_audio
-    snapshot_has_voice = has_voice
-    snapshot_has_document = has_document
-    snapshot_photo_id = message.photo[-1].file_id if has_photo else None
-    snapshot_animation_id = message.animation.file_id if has_animation else None
-    snapshot_video_id = message.video.file_id if has_video else None
-    snapshot_video_note_id = message.video_note.file_id if has_video_note else None
-    snapshot_sticker_id = message.sticker.file_id if has_sticker else None
-    snapshot_audio_id = message.audio.file_id if has_audio else None
-    snapshot_voice_id = message.voice.file_id if has_voice else None
-    snapshot_document_id = message.document.file_id if has_document else None
-    snapshot_caption = cap(message)
-    snapshot_text = make_broadcast_msg(message.text) if not has_photo and not has_animation and not has_video and not has_video_note and not has_sticker and not has_audio and not has_voice and not has_document else None
-
-    _BROADCAST_DELAY = 1.0 / 28
-
-    def _run_broadcast():
-        success, fail = 0, 0
-        for uid in target_users:
-            try:
-                if snapshot_has_photo:
-                    bot.send_photo(uid, snapshot_photo_id, caption=snapshot_caption, parse_mode="HTML")
-                elif snapshot_has_animation:
-                    bot.send_animation(uid, snapshot_animation_id, caption=snapshot_caption, parse_mode="HTML")
-                elif snapshot_has_video:
-                    bot.send_video(uid, snapshot_video_id, caption=snapshot_caption, parse_mode="HTML")
-                elif snapshot_has_video_note:
-                    bot.send_video_note(uid, snapshot_video_note_id)
-                elif snapshot_has_sticker:
-                    bot.send_sticker(uid, snapshot_sticker_id)
-                elif snapshot_has_audio:
-                    bot.send_audio(uid, snapshot_audio_id, caption=snapshot_caption, parse_mode="HTML")
-                elif snapshot_has_voice:
-                    bot.send_voice(uid, snapshot_voice_id, caption=snapshot_caption, parse_mode="HTML")
-                elif snapshot_has_document:
-                    bot.send_document(uid, snapshot_document_id, caption=snapshot_caption, parse_mode="HTML")
-                else:
-                    bot.send_message(uid, snapshot_text, parse_mode="HTML")
-                success += 1
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "Too Many Requests" in err:
-                    try:
-                        wait = int(re.search(r"retry after (\d+)", err).group(1))
-                    except Exception:
-                        wait = 30
-                    time.sleep(min(wait, 60))
-                    try:
-                        if snapshot_has_photo:
-                            bot.send_photo(uid, snapshot_photo_id, caption=snapshot_caption, parse_mode="HTML")
-                        elif snapshot_has_animation:
-                            bot.send_animation(uid, snapshot_animation_id, caption=snapshot_caption, parse_mode="HTML")
-                        elif snapshot_has_video:
-                            bot.send_video(uid, snapshot_video_id, caption=snapshot_caption, parse_mode="HTML")
-                        elif snapshot_has_video_note:
-                            bot.send_video_note(uid, snapshot_video_note_id)
-                        elif snapshot_has_sticker:
-                            bot.send_sticker(uid, snapshot_sticker_id)
-                        elif snapshot_has_audio:
-                            bot.send_audio(uid, snapshot_audio_id, caption=snapshot_caption, parse_mode="HTML")
-                        elif snapshot_has_voice:
-                            bot.send_voice(uid, snapshot_voice_id, caption=snapshot_caption, parse_mode="HTML")
-                        elif snapshot_has_document:
-                            bot.send_document(uid, snapshot_document_id, caption=snapshot_caption, parse_mode="HTML")
-                        else:
-                            bot.send_message(uid, snapshot_text, parse_mode="HTML")
-                        success += 1
-                    except Exception:
-                        fail += 1
-                else:
-                    fail += 1
-            time.sleep(_BROADCAST_DELAY)
-        try:
-            bot.send_message(
-                admin_chat_id,
-                f"✅ <b>BROADCAST COMPLETE!</b>\n\n"
-                f"✅ <b>𝗦𝗼𝗳𝗼𝗹:</b> {success} জন 🔥\n"
-                f"❌ <b>𝗕𝗮𝗿𝘁𝗵𝗼:</b> {fail} জন",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    threading.Thread(target=_run_broadcast, daemon=True, name="broadcast").start()
 
 
 _pending_add = {}
@@ -4809,35 +5016,27 @@ def _start_countdown(chat_id, msg_id, svc, flag, c_name, display_num, scnt):
                 remaining = DURATION
 
             mins = remaining // 60
-secs = remaining % 60
+            secs = remaining % 60
+            text = (
+                f"✅ <b>Number Assigned Successfully !</b>\n\n"
+                f"🔧 <b>Platform :</b> {svc.capitalize()}\n"
+                f"🌍 <b>Country :</b> {flag} {c_name}\n\n"
+                f"📞 <b>Number :</b> <code>{display_num}</code>\n\n"
+                f"⏱ <b>Auto code fetch :</b> {mins:02d}:{secs:02d}s"
+            )
+            result = try_update(text)
+            if result is None:
+                break  # message gone, stop
+            elif type(result) is int:
+                # rate-limited — wait the full retry_after, then resume
+                wait = min(result, 3600)
+                print(f"[COUNTDOWN] Rate limited for {wait}s, pausing timer for {chat_id}")
+                cancel.wait(wait)
+            else:
+                cancel.wait(TICK)
 
-text = (
-    f"✅ <b>Number Assigned Successfully !</b>\n\n"
-    f"🔧 <b>Platform :</b> {svc.capitalize()}\n"
-    f"🌍 <b>Country :</b> {flag} {c_name}\n\n"
-    f"📞 <b>Number :</b> <code>{display_num}</code>\n\n"
-    f"⏱ <b>Auto code fetch :</b> {mins:02d}:{secs:02d}s"
-)
+    threading.Thread(target=run, daemon=True).start()
 
-try:
-    result = try_update(text)
-
-    if result is None:
-        break
-
-    elif type(result) is int:
-        wait = min(result, 3600)
-        print(f"[COUNTDOWN] Rate limited for {wait}s, pausing timer for {chat_id}")
-        cancel.wait(wait)
-
-    else:
-        time.sleep(1)
-
-except Exception as e:
-    print(f"Countdown Error: {e}")
-    break
-
-threading.Thread(target=run, daemon=True).start()
 
 def _settings_text(uid=None):
     """Per-admin settings. If uid given, show that admin's own settings."""
@@ -5166,7 +5365,7 @@ def _go_admin_panel(message, text="🔥 <b>ADMIN PANEL</b>"):
     m_admin = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m_admin.add("➕ 𝗡𝘂𝗺𝗯𝗮𝗿 𝗔𝗱𝗱", "🗑️ 𝗦𝗼𝗯 𝗖𝗹𝗲𝗮𝗿")
     m_admin.add("🔥📢 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", "⚡👥 𝗨𝘀𝗲𝗿 𝗖𝗼𝘂𝗻𝘁")
-    m_admin.add("📋👥 𝗨𝘀𝗲𝗿 𝗟𝗶𝘀𝘁", "📈 𝗢𝗧𝗣 𝗦𝘁𝗮𝘁𝘀")
+    m_admin.add("📋👥 𝗨𝘀𝗲𝗿 𝗟𝗶𝘀𝘁", "📈 𝗢𝗧𝗣 𝗦𝘁𝗮𝘁𝘂𝘀")
     m_admin.add("🎭 𝗗𝗘𝗠𝗢 𝗢𝗧𝗣")
     m_admin.add("➕ 𝗔𝗱𝗱 𝗣𝗮𝗻𝗲𝗹", "🗑️ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗣𝗮𝗻𝗲𝗹")
     m_admin.add("➕ 𝗔𝗱𝗱 𝗦𝗲𝗿𝘃𝗶𝗰𝗲", "🗑️ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗦𝗲𝗿𝘃𝗶𝗰𝗲")
@@ -5249,41 +5448,52 @@ def _save_new_template(message):
         bot.register_next_step_handler(msg, _save_new_template)
         return
 
-    # ── Validate: try formatting with dummy values to catch bad placeholders ──
-    _DUMMY_VARS = {
-        "uname": "TestUser", "uid": "123456789",
-        "svc": "INSTAGRAM", "number": "8801712345678",
-        "country": "Bangladesh", "flag": "🇧🇩", "otp": "123456",
-        "vname": "TestUser", "text": "Test broadcast",
-    }
+    # Build a preview with dummy data
+    dummy = {"svc": "WHATSAPP", "number": "+880 1234-XXXX", "country": "Bangladesh", "flag": "🇧🇩", "otp": "123456"}
     try:
-        new_text.format(**_DUMMY_VARS)
-    except (KeyError, ValueError, IndexError) as fmt_err:
-        msg = bot.send_message(
-            message.chat.id,
-            f"❌ <b>টেমপ্লেট ভুল আছে!</b>\n\n"
-            f"🔴 <b>Error:</b> <code>{fmt_err}</code>\n\n"
-            f"⚠️ <b>সমস্যা:</b> অজানা placeholder বা ভুল <code>{{</code> <code>}}</code> ব্যবহার।\n\n"
-            f"✅ <b>সঠিক placeholder গুলো:</b>\n"
-            f"<code>{_TEMPLATE_VARS.get(key, 'N/A')}</code>\n\n"
-            f"💡 যদি সাধারণ বন্ধনী দরকার হয়, double করো: <code>{{{{</code> এবং <code>}}}}</code>\n\n"
-            f"আবার লিখো:",
-            reply_markup=_back_admin_kb(),
-            parse_mode="HTML",
-        )
-        _edit_template_state[uid] = state
-        bot.register_next_step_handler(msg, _save_new_template)
-        return
+        preview_html = new_text.format(**dummy)
+    except Exception:
+        preview_html = new_text
 
-    _templates[key] = new_text
-    save_templates()
+    # Try rendering as HTML to catch broken tags early
+    html_ok = True
+    try:
+        bot.send_message(chat_id=uid, text=preview_html, parse_mode="HTML")
+    except Exception as e:
+        err = str(e)
+        if "parse" in err.lower() or "entity" in err.lower() or "can't find" in err.lower() or "Bad Request" in err:
+            html_ok = False
+            try:
+                bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "⚠️ <b>HTML ত্রুটি পাওয়া গেছে!</b>\n\n"
+                        f"<code>{err[:300]}</code>\n\n"
+                        "ফরমেট সেভ হলে OTP HTML ছাড়া (plain text) পাঠানো হবে।\n"
+                        "⬇️ তবুও সেভ করতে চাইলে Confirm করো।"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
     label = _TEMPLATE_LABELS.get(key, key)
-    _go_admin_panel(
-        message,
-        f"✅🔥 <b>মেসেজ আপডেট হয়েছে!</b>\n\n"
-        f"✏️ <b>{label}</b>\n\n"
-        f"📄 নতুন ফরমেট সেভ হয়েছে।",
+    confirm_markup = types.InlineKeyboardMarkup(row_width=2)
+    confirm_markup.add(
+        types.InlineKeyboardButton("✅ সেভ করো", callback_data=f"tmpl_confirm:{key}"),
+        types.InlineKeyboardButton("✏️ আবার লিখো", callback_data=f"tmpl_reedit:{key}"),
     )
+    status_line = "✅ HTML সঠিক আছে।" if html_ok else "⚠️ HTML ভুল আছে — plain text হিসেবে পাঠানো হবে।"
+    bot.send_message(
+        message.chat.id,
+        f"👆 <b>উপরে প্রিভিউ দেখো।</b>\n\n"
+        f"{status_line}\n\n"
+        f"<b>এই ফরমেট সেভ করবে?</b>",
+        reply_markup=confirm_markup,
+        parse_mode="HTML",
+    )
+    # Store pending template — saved only on confirm callback
+    _edit_template_state[uid] = {"key": key, "pending": new_text}
 
 
 def _cancel_kb():
@@ -5307,7 +5517,7 @@ _ALL_MENU_BTNS = {
     "⚙️ 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟 ⚙️", "🔙 Main Menu",
     "➕ 𝗡𝘂𝗺𝗯𝗮𝗿 𝗔𝗱𝗱", "🗑️ 𝗦𝗼𝗯 𝗖𝗹𝗲𝗮𝗿",
     "🔥📢 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁", "⚡👥 𝗨𝘀𝗲𝗿 𝗖𝗼𝘂𝗻𝘁",
-    "📋👥 𝗨𝘀𝗲𝗿 𝗟𝗶𝘀𝘁", "📈 𝗢𝗧𝗣 𝗦𝘁𝗮𝘁𝘀", "🎭 𝗗𝗘𝗠𝗢 𝗢𝗧𝗣",
+    "📋👥 𝗨𝘀𝗲𝗿 𝗟𝗶𝘀𝘁", "🎭 𝗗𝗘𝗠𝗢 𝗢𝗧𝗣",
     "➕ 𝗔𝗱𝗱 𝗣𝗮𝗻𝗲𝗹", "🗑️ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗣𝗮𝗻𝗲𝗹",
     "➕ 𝗔𝗱𝗱 𝗦𝗲𝗿𝘃𝗶𝗰𝗲", "🗑️ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗦𝗲𝗿𝘃𝗶𝗰𝗲",
     "📊 𝗣𝗮𝗻𝗲𝗹𝘀", "🔍 𝗧𝗲𝘀𝘁 𝗣𝗮𝗻𝗲𝗹", "👑 𝗔𝗱𝗱 𝗔𝗱𝗺𝗶𝗻", "🗑️ 𝗥𝗲𝗺𝗼𝘃𝗲 𝗔𝗱𝗺𝗶𝗻",
@@ -5459,17 +5669,30 @@ threading.Thread(target=panel5_monitor, daemon=True).start()
 threading.Thread(target=panel6_monitor, daemon=True).start()
 threading.Thread(target=demo_monitor, daemon=True).start()
 
+for _ep in _HARDCODED_EXTRA_PANELS:
+    _start_dynamic_panel(_ep)
+    print(f"[HARDCODED] Starting panel: {_ep['id']} ({_ep['host']})")
+
 for _dp in _dynamic_panels:
     _start_dynamic_panel(_dp)
     print(f"[DYN] Loaded saved panel: {_dp['id']} ({_dp['host']})")
 
-print("🔥 AR OTP BOT is running with 6-PANEL AUTO OTP MONITOR... 🔥")
-print("   ▸ Panel 1: Mahofuza        (91.232.105.47)")
-print("   ▸ Panel 2: Sagardas50      (94.23.31.29)")
-print("   ▸ Panel 3: Rabbi1_FD       (168.119.13.175)")
-print("   ▸ Panel 4: Rabbi12         (144.217.71.192)")
-print("   ▸ Panel 5: Rabbi12_v2      (51.75.144.178)")
-print("   ▸ Panel 6: TrueSMS/Ranges  (truesms.net)")
+print("🔥 AR OTP BOT is running with 15-PANEL AUTO OTP MONITOR... 🔥")
+print("   ▸ P1 : Mahofuza        (91.232.105.47)")
+print("   ▸ P2 : Sagardas50      (94.23.31.29)")
+print("   ▸ P3 : Rabbi1_FD       (168.119.13.175)")
+print("   ▸ P4 : Rabbi12         (144.217.71.192)")
+print("   ▸ P5 : Rabbi12_v2      (51.75.144.178)")
+print("   ▸ P6 : TrueSMS/Ranges  (truesms.net)")
+print("   ▸ P7 : Rabbi12@        (54.36.173.235)")
+print("   ▸ P8 : Rabbi5          (54.39.104.241)")
+print("   ▸ P9 : Mahofuza12      (139.99.69.196)")
+print("   ▸ P10: Rabbi12         (139.99.9.4)")
+print("   ▸ P11: mahofuza@       (213.32.24.208)")
+print("   ▸ P12: Rabbi200        (15.235.182.3/konekta)")
+print("   ▸ P13: Rabbi12@        (nexor-iprn.com)")
+print("   ▸ P14: Rabbi12         (51.77.52.79)")
+print("   ▸ P15: Dasbabu50_FD    (51.210.208.26)")
 
 
 def _clear_webhook():
@@ -5492,7 +5715,6 @@ while True:
             allowed_updates=["message", "callback_query"],
             none_stop=True,
             restart_on_change=False,
-            skip_pending=True,
         )
     except requests.exceptions.ReadTimeout:
         print("[POLLING] ReadTimeout — restarting in 5s...")
