@@ -4817,17 +4817,23 @@ def _start_countdown(chat_id, msg_id, svc, flag, c_name, display_num, scnt):
                 f"📞 <b>Number :</b> <code>{display_num}</code>\n\n"
                 f"⏱ <b>Auto code fetch :</b> {mins:02d}:{secs:02d}s"
             )
-            result = try_update(text)
-            if result is None:
-                break  # message gone, stop
-            elif type(result) is int:
-                # rate-limited — wait the full retry_after, then resume
-                wait = min(result, 3600)
-                print(f"[COUNTDOWN] Rate limited for {wait}s, pausing timer for {chat_id}")
-                cancel.wait(wait)
-            else:
-                cancel.wait(TICK)
+            try:
+    result = try_update(text)
 
+    if result is None:
+        break
+
+    elif type(result) is int:
+        wait = min(result, 3600)
+        print(f"[COUNTDOWN] Rate limited for {wait}s, pausing timer for {chat_id}")
+        cancel.wait(wait)
+
+    else:
+        cancel.wait(TICK)
+
+except Exception as e:
+    print(f"Countdown Error: {e}")
+    break
     threading.Thread(target=run, daemon=True).start()
 
 
