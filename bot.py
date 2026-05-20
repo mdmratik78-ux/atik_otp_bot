@@ -4809,15 +4809,17 @@ def _start_countdown(chat_id, msg_id, svc, flag, c_name, display_num, scnt):
                 remaining = DURATION
 
             mins = remaining // 60
-            secs = remaining % 60
-            text = (
-                f"✅ <b>Number Assigned Successfully !</b>\n\n"
-                f"🔧 <b>Platform :</b> {svc.capitalize()}\n"
-                f"🌍 <b>Country :</b> {flag} {c_name}\n\n"
-                f"📞 <b>Number :</b> <code>{display_num}</code>\n\n"
-                f"⏱ <b>Auto code fetch :</b> {mins:02d}:{secs:02d}s"
-            )
-            try:
+secs = remaining % 60
+
+text = (
+    f"✅ <b>Number Assigned Successfully !</b>\n\n"
+    f"🔧 <b>Platform :</b> {svc.capitalize()}\n"
+    f"🌍 <b>Country :</b> {flag} {c_name}\n\n"
+    f"📞 <b>Number :</b> <code>{display_num}</code>\n\n"
+    f"⏱ <b>Auto code fetch :</b> {mins:02d}:{secs:02d}s"
+)
+
+try:
     result = try_update(text)
 
     if result is None:
@@ -4829,13 +4831,13 @@ def _start_countdown(chat_id, msg_id, svc, flag, c_name, display_num, scnt):
         cancel.wait(wait)
 
     else:
-        cancel.wait(TICK)
+        time.sleep(1)
 
 except Exception as e:
     print(f"Countdown Error: {e}")
     break
-    threading.Thread(target=run, daemon=True).start()
 
+threading.Thread(target=run, daemon=True).start()
 
 def _settings_text(uid=None):
     """Per-admin settings. If uid given, show that admin's own settings."""
