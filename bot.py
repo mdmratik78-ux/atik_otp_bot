@@ -5,6 +5,7 @@ import os
 import re
 import time
 import threading
+import heapq
 import datetime
 import requests
 import phonenumbers
@@ -97,7 +98,7 @@ DATA_FILE = "stock_data.json"
 USERS_FILE = "users.json"
 SEEN_FILE = "seen_otps.json"
 
-bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=40)
+bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=100)
 
 # ── Persistent helpers ────────────────────────────────────────────────────────
 
@@ -293,14 +294,41 @@ def is_auto_delete():
     return _group_settings.get("auto_delete", True)
 
 
+_delete_queue = []
+_delete_queue_lock = threading.Lock()
+_delete_queue_event = threading.Event()
+
+
+def _delete_worker():
+    """Single background thread that handles all scheduled message deletions."""
+    while True:
+        with _delete_queue_lock:
+            now = time.time()
+            while _delete_queue and _delete_queue[0][0] <= now:
+                _, chat_id, msg_id = heapq.heappop(_delete_queue)
+                try:
+                    bot.delete_message(chat_id, msg_id)
+                except Exception:
+                    pass
+            next_fire = _delete_queue[0][0] if _delete_queue else None
+        if next_fire is None:
+            _delete_queue_event.wait(timeout=60)
+            _delete_queue_event.clear()
+        else:
+            wait = max(0.0, next_fire - time.time())
+            _delete_queue_event.wait(timeout=wait)
+            _delete_queue_event.clear()
+
+
+threading.Thread(target=_delete_worker, daemon=True, name="delete-worker").start()
+
+
 def _schedule_delete(chat_id, msg_id):
     delay = _group_settings.get("auto_delete_seconds", 3600)
-    def _do_delete():
-        try:
-            bot.delete_message(chat_id, msg_id)
-        except Exception:
-            pass
-    threading.Timer(delay, _do_delete).start()
+    fire_at = time.time() + delay
+    with _delete_queue_lock:
+        heapq.heappush(_delete_queue, (fire_at, chat_id, msg_id))
+    _delete_queue_event.set()
 
 # ── Message templates ──────────────────────────────────────────────────────────
 
@@ -1675,14 +1703,44 @@ def fetch_panel2():
 # ── Shared OTP processor ──────────────────────────────────────────────────────
 
 
+_seen_dirty = False
+_seen_dirty_lock = threading.Lock()
+
+
+def _seen_saver():
+    """Background thread: flush seen_otps to disk at most once every 30 seconds,
+    and trim the dict if it grows beyond 50 000 entries to keep saves fast."""
+    global seen_otps, _seen_dirty
+    MAX_SEEN = 50_000
+    while True:
+        time.sleep(30)
+        with _seen_dirty_lock:
+            if not _seen_dirty:
+                continue
+            _seen_dirty = False
+        with seen_lock:
+            if len(seen_otps) > MAX_SEEN:
+                keys = list(seen_otps.keys())
+                seen_otps = {k: True for k in keys[-MAX_SEEN:]}
+            snapshot = dict(seen_otps)
+        try:
+            save_json(SEEN_FILE, snapshot)
+        except Exception as e:
+            print(f"[SEEN-SAVER] Save error: {e}")
+
+
+threading.Thread(target=_seen_saver, daemon=True, name="seen-saver").start()
+
+
 def process_new_otps(current):
-    global seen_otps
+    global seen_otps, _seen_dirty
     for key, (number, otp, sms_txt, service) in current.items():
         with seen_lock:
             if key in seen_otps:
                 continue
             seen_otps[key] = True
-            save_json(SEEN_FILE, seen_otps)
+        with _seen_dirty_lock:
+            _seen_dirty = True
         clean = re.sub(r"\D", "", str(number))
         with user_map_lock:
             t_start = assigned_time.get(clean)
@@ -4574,68 +4632,105 @@ def do_broadcast(message):
         lambda m: make_broadcast_msg(m.caption) if m.caption else make_broadcast_msg("")
     )
 
-    bot.send_message(
+    status_msg = bot.send_message(
         message.chat.id,
-        f"⏳🔥 <b>{len(users)} জনকে পাঠানো হচ্ছে...</b> 🔥⏳",
-        parse_mode="HTML",
-    )
-
-    success, fail = 0, 0
-    for uid in list(users):
-        try:
-            if has_photo:
-                bot.send_photo(
-                    uid,
-                    message.photo[-1].file_id,
-                    caption=cap(message),
-                    parse_mode="HTML",
-                )
-            elif has_animation:
-                bot.send_animation(
-                    uid,
-                    message.animation.file_id,
-                    caption=cap(message),
-                    parse_mode="HTML",
-                )
-            elif has_video:
-                bot.send_video(
-                    uid, message.video.file_id, caption=cap(message), parse_mode="HTML"
-                )
-            elif has_video_note:
-                bot.send_video_note(uid, message.video_note.file_id)
-            elif has_sticker:
-                bot.send_sticker(uid, message.sticker.file_id)
-            elif has_audio:
-                bot.send_audio(
-                    uid, message.audio.file_id, caption=cap(message), parse_mode="HTML"
-                )
-            elif has_voice:
-                bot.send_voice(
-                    uid, message.voice.file_id, caption=cap(message), parse_mode="HTML"
-                )
-            elif has_document:
-                bot.send_document(
-                    uid,
-                    message.document.file_id,
-                    caption=cap(message),
-                    parse_mode="HTML",
-                )
-            else:
-                bot.send_message(
-                    uid, make_broadcast_msg(message.text), parse_mode="HTML"
-                )
-            success += 1
-        except Exception:
-            fail += 1
-
-    bot.send_message(
-        message.chat.id,
-        f" <b>BROADCAST COMPLETE!</b> \n\n"
-        f"✅ <b>𝗦𝗼𝗳𝗼𝗹:</b> {success} জন 🔥\n"
-        f"❌ <b>𝗕𝗮𝗿𝘁𝗵𝗼:</b> {fail} জন ",
+        f"⏳🔥 <b>{len(users)} জনকে পাঠানো হচ্ছে... Background-e চলছে!</b> 🔥⏳",
         parse_mode="HTML",
     )
     _go_admin_panel(message)
+
+    admin_chat_id = message.chat.id
+    target_users = list(users)
+
+    snapshot_has_photo = has_photo
+    snapshot_has_animation = has_animation
+    snapshot_has_video = has_video
+    snapshot_has_video_note = has_video_note
+    snapshot_has_sticker = has_sticker
+    snapshot_has_audio = has_audio
+    snapshot_has_voice = has_voice
+    snapshot_has_document = has_document
+    snapshot_photo_id = message.photo[-1].file_id if has_photo else None
+    snapshot_animation_id = message.animation.file_id if has_animation else None
+    snapshot_video_id = message.video.file_id if has_video else None
+    snapshot_video_note_id = message.video_note.file_id if has_video_note else None
+    snapshot_sticker_id = message.sticker.file_id if has_sticker else None
+    snapshot_audio_id = message.audio.file_id if has_audio else None
+    snapshot_voice_id = message.voice.file_id if has_voice else None
+    snapshot_document_id = message.document.file_id if has_document else None
+    snapshot_caption = cap(message)
+    snapshot_text = make_broadcast_msg(message.text) if not has_photo and not has_animation and not has_video and not has_video_note and not has_sticker and not has_audio and not has_voice and not has_document else None
+
+    _BROADCAST_DELAY = 1.0 / 28
+
+    def _run_broadcast():
+        success, fail = 0, 0
+        for uid in target_users:
+            try:
+                if snapshot_has_photo:
+                    bot.send_photo(uid, snapshot_photo_id, caption=snapshot_caption, parse_mode="HTML")
+                elif snapshot_has_animation:
+                    bot.send_animation(uid, snapshot_animation_id, caption=snapshot_caption, parse_mode="HTML")
+                elif snapshot_has_video:
+                    bot.send_video(uid, snapshot_video_id, caption=snapshot_caption, parse_mode="HTML")
+                elif snapshot_has_video_note:
+                    bot.send_video_note(uid, snapshot_video_note_id)
+                elif snapshot_has_sticker:
+                    bot.send_sticker(uid, snapshot_sticker_id)
+                elif snapshot_has_audio:
+                    bot.send_audio(uid, snapshot_audio_id, caption=snapshot_caption, parse_mode="HTML")
+                elif snapshot_has_voice:
+                    bot.send_voice(uid, snapshot_voice_id, caption=snapshot_caption, parse_mode="HTML")
+                elif snapshot_has_document:
+                    bot.send_document(uid, snapshot_document_id, caption=snapshot_caption, parse_mode="HTML")
+                else:
+                    bot.send_message(uid, snapshot_text, parse_mode="HTML")
+                success += 1
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "Too Many Requests" in err:
+                    try:
+                        wait = int(re.search(r"retry after (\d+)", err).group(1))
+                    except Exception:
+                        wait = 30
+                    time.sleep(min(wait, 60))
+                    try:
+                        if snapshot_has_photo:
+                            bot.send_photo(uid, snapshot_photo_id, caption=snapshot_caption, parse_mode="HTML")
+                        elif snapshot_has_animation:
+                            bot.send_animation(uid, snapshot_animation_id, caption=snapshot_caption, parse_mode="HTML")
+                        elif snapshot_has_video:
+                            bot.send_video(uid, snapshot_video_id, caption=snapshot_caption, parse_mode="HTML")
+                        elif snapshot_has_video_note:
+                            bot.send_video_note(uid, snapshot_video_note_id)
+                        elif snapshot_has_sticker:
+                            bot.send_sticker(uid, snapshot_sticker_id)
+                        elif snapshot_has_audio:
+                            bot.send_audio(uid, snapshot_audio_id, caption=snapshot_caption, parse_mode="HTML")
+                        elif snapshot_has_voice:
+                            bot.send_voice(uid, snapshot_voice_id, caption=snapshot_caption, parse_mode="HTML")
+                        elif snapshot_has_document:
+                            bot.send_document(uid, snapshot_document_id, caption=snapshot_caption, parse_mode="HTML")
+                        else:
+                            bot.send_message(uid, snapshot_text, parse_mode="HTML")
+                        success += 1
+                    except Exception:
+                        fail += 1
+                else:
+                    fail += 1
+            time.sleep(_BROADCAST_DELAY)
+        try:
+            bot.send_message(
+                admin_chat_id,
+                f"✅ <b>BROADCAST COMPLETE!</b>\n\n"
+                f"✅ <b>𝗦𝗼𝗳𝗼𝗹:</b> {success} জন 🔥\n"
+                f"❌ <b>𝗕𝗮𝗿𝘁𝗵𝗼:</b> {fail} জন",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run_broadcast, daemon=True, name="broadcast").start()
 
 
 _pending_add = {}
@@ -5389,6 +5484,7 @@ while True:
             allowed_updates=["message", "callback_query"],
             none_stop=True,
             restart_on_change=False,
+            skip_pending=True,
         )
     except requests.exceptions.ReadTimeout:
         print("[POLLING] ReadTimeout — restarting in 5s...")
