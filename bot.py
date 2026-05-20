@@ -98,7 +98,7 @@ DATA_FILE = "stock_data.json"
 USERS_FILE = "users.json"
 SEEN_FILE = "seen_otps.json"
 
-bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=100)
+bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=1000)
 
 # ── Persistent helpers ────────────────────────────────────────────────────────
 
